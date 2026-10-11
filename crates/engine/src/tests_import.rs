@@ -57,6 +57,87 @@ fn recursive_import_with_duplicates() {
     let _ = std::fs::remove_dir_all(&src);
 }
 
+/// The scan reads headers, not samples: multi-megabyte raws scan unhashed, and a same-bytes twin
+/// still matches by content — only files whose size another file shares are hashed.
+#[test]
+fn scan_hashes_only_files_duplicate_detection_can_match() {
+    let src = temp_dir("scanhash");
+    let twin: Vec<u16> = (0..2048 * 1536).map(|i| (u64::try_from(i).unwrap_or(0).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 33) as u16).collect();
+    let a = crate::tests_xmp::synthetic_dng_of(2048, 1536, "RGGB", twin, None, Default::default());
+    std::fs::write(src.join("a.dng"), &a).unwrap();
+    std::fs::write(src.join("a-copy.dng"), &a).unwrap(); // same bytes
+    let mut c = a.clone();
+    let mid = c.len() / 2;
+    c[mid] ^= 0xFF; // same size, other bytes (the probe never reads samples)
+    std::fs::write(src.join("c.dng"), &c).unwrap();
+    let lone: Vec<u16> = (0..1024 * 768).map(|i| (u64::try_from(i).unwrap_or(0).wrapping_mul(0x2545_F491_4F6C_DD1D) >> 33) as u16).collect();
+    let solo = crate::tests_xmp::synthetic_dng_of(1024, 768, "RGGB", lone, None, Default::default());
+    std::fs::write(src.join("solo.dng"), &solo).unwrap(); // large, and a size of its own
+    assert!(a.len() as u64 > 512 * 1024 && solo.len() as u64 > 512 * 1024 && solo.len() != a.len(), "fixtures must clear the sparse path");
+    let mut s = Session::new().with_fs();
+    let r = s.execute("library.importPreview", &json!({"paths": [src.to_string_lossy()]})).unwrap();
+    assert_eq!(r["scanned"], 4, "{r}");
+    let dup_of = |name: &str| {
+        r["candidates"].as_array().unwrap().iter().find(|c| c["name"] == name).unwrap_or_else(|| panic!("{name} missing: {r}"))["duplicate"].clone()
+    };
+    let twins = [dup_of("a.dng"), dup_of("a-copy.dng")];
+    assert_eq!(twins.iter().filter(|d| *d == "content").count(), 1, "{r}: exactly one twin is the duplicate");
+    assert!(twins.contains(&Value::Null), "{r}: the other twin stands");
+    assert_eq!(dup_of("c.dng"), Value::Null, "{r}: same size, other bytes");
+    assert_eq!(dup_of("solo.dng"), Value::Null, "{r}");
+    // the kept probes: the twins and the same-size file hashed, the unique size not
+    let hash_of = |name: &str| {
+        s.import_probes
+            .iter()
+            .find(|(p, _)| Path::new(p.as_str()).file_name().is_some_and(|n| n == name))
+            .unwrap_or_else(|| panic!("{name} has no kept probe"))
+            .1
+            .content_hash
+            .clone()
+    };
+    let (ha, hb, hc, hs) = (hash_of("a.dng"), hash_of("a-copy.dng"), hash_of("c.dng"), hash_of("solo.dng"));
+    assert!(ha.as_ref().is_some_and(|h| h.len() == 32));
+    assert_eq!(hb, ha, "twins share a hash");
+    assert!(hc.as_ref().is_some_and(|h| h.len() == 32), "same size hashes too");
+    assert_ne!(hc, ha, "same size, other bytes, other hash");
+    assert_eq!(hs, None, "nothing shares its size: unhashed");
+    // the sparse probe still describes fully (dimensions, not stubs)
+    let dims = |name: &str| {
+        r["candidates"].as_array().unwrap().iter().find(|c| c["name"] == name).map(|c| (c["width"].clone(), c["height"].clone())).unwrap()
+    };
+    assert_eq!(dims("a.dng"), (json!(2048), json!(1536)), "{r}");
+    let _ = std::fs::remove_dir_all(&src);
+}
+
+/// Files the scan left unhashed import with content hashes (added in place), so a copy
+/// elsewhere still matches the imported photo by content.
+#[test]
+fn add_import_hashes_what_the_scan_left_unhashed() {
+    let src = temp_dir("addhash");
+    let twin: Vec<u16> = (0..2048 * 1536).map(|i| (u64::try_from(i).unwrap_or(0).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 33) as u16).collect();
+    let a = crate::tests_xmp::synthetic_dng_of(2048, 1536, "RGGB", twin, None, Default::default());
+    std::fs::write(src.join("a.dng"), &a).unwrap();
+    let solo = crate::tests_xmp::synthetic_dng_of(1024, 768, "RGGB", vec![7u16; 1024 * 768], None, Default::default());
+    std::fs::write(src.join("solo.dng"), &solo).unwrap();
+    let mut s = Session::new().with_fs();
+    s.execute("library.importPreview", &json!({"paths": [src.to_string_lossy()]})).unwrap();
+    let r = s.execute("library.import", &json!({"paths": [src.to_string_lossy()]})).unwrap();
+    assert_eq!(ids(&r, "imported"), 2, "{r}");
+    for p in s.catalog.photos() {
+        assert!(p.content_hash.as_ref().is_some_and(|h| h.len() == 32), "{}", p.file_name);
+    }
+    let want = lightcraft_preview::hash_bytes(&a).to_string();
+    assert!(s.catalog.photos().any(|p| p.file_name == "a.dng" && p.content_hash.as_deref() == Some(want.as_str())), "the hash is of the bytes");
+    // a copy under another path matches the imported photo by content
+    let elsewhere = temp_dir("addhash2");
+    std::fs::write(elsewhere.join("a2.dng"), &a).unwrap();
+    let r = s.execute("library.import", &json!({"paths": [elsewhere.to_string_lossy()]})).unwrap();
+    assert_eq!(ids(&r, "imported"), 0, "{r}");
+    assert_eq!(r["duplicates"][0]["reason"], "content", "{r}");
+    let _ = std::fs::remove_dir_all(&src);
+    let _ = std::fs::remove_dir_all(&elsewhere);
+}
+
 #[test]
 fn copy_into_library_and_persist() {
     let src = temp_dir("copysrc");

@@ -2,6 +2,13 @@
 
 ## 2026-10-11
 
+### Fast import scan from camera cards
+- Import from Device no longer reads every byte of every file to show the review grid: the scan
+  reads headers only (0.3 % of a 212 MB Hasselblad 3FR), hashing just the files whose size
+  another file shares. A card of 1501 3FR files scans in under a minute instead of about two
+  hours. Duplicate detection, copy verification, and every imported photo's content hash work
+  as before.
+
 ### JPEG XL export
 - Export as JPEG XL (issue #247): Format ▸ JPEG XL in the Export dialog, `format: "jxl"` for agents and the CLI
   (`render in.raw -o out.jxl`). Quality as for JPEG, or Lossless; Effort (Fast / Normal) trades time for a

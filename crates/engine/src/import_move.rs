@@ -214,6 +214,27 @@ pub(crate) fn copy_new(src: &Path, dir: &Path, name: &str, expect: Option<lightc
     Err(format!("copy {}: no free name in {}", src.display(), dir.display()))
 }
 
+/// [`copy_new`] without a probe hash: the source is hashed as it streams into the copy, and the
+/// copy is hashed back and compared — one read of the source instead of two. The scan reads
+/// headers only now, so most copies arrive hashless; the verification is the same strength as
+/// the byte comparison it replaces. Returns the new path and the verified hash.
+pub(crate) fn copy_new_streaming(src: &Path, dir: &Path, name: &str) -> Result<(PathBuf, lightcraft_preview::Hash128), String> {
+    fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let (stem, ext) = match name.rsplit_once('.') {
+        Some((s, e)) if !s.is_empty() => (s.to_string(), format!(".{e}")),
+        _ => (name.to_string(), String::new()),
+    };
+    for i in 0..100_000u32 {
+        let d = if i == 0 { dir.join(name) } else { dir.join(format!("{stem}-{i}{ext}")) };
+        match copy_streaming_verified(src, &d) {
+            Ok(h) => return Ok((d, h)),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(format!("copy {}: {e} (nothing was imported from it; the original is untouched)", src.display())),
+        }
+    }
+    Err(format!("copy {}: no free name in {}", src.display(), dir.display()))
+}
+
 /// Undo a [`place`]: remove what it created at the destination (the sources were never touched).
 pub(crate) fn rollback(p: &Placed) {
     for sc in p.sidecars.iter().filter(|s| s.created) {
@@ -330,8 +351,55 @@ pub(crate) fn copy_verified(src: &Path, dst: &Path, expect: Option<lightcraft_pr
     r
 }
 
+/// Copy into a new file, sync it to disk and verify it: the source's hash is computed as its
+/// bytes stream into the copy, then the copy is hashed back and the two compared. On any
+/// failure the partial copy is removed. (The counterpart of [`copy_verified`] for copies whose
+/// probe read headers only and carries no hash.)
+pub(crate) fn copy_streaming_verified(src: &Path, dst: &Path) -> io::Result<lightcraft_preview::Hash128> {
+    let mut out = OpenOptions::new().write(true).create_new(true).open(dst)?;
+    let r = (|| {
+        let mut inp = File::open(src)?;
+        if injected(Fault::FailWrite) {
+            out.write_all(b"partial")?;
+            return Err(io::Error::other("write failed (injected)"));
+        }
+        let mut h = lightcraft_preview::Hasher128::new();
+        let mut buf = vec![0u8; 1 << 20];
+        loop {
+            let n = fill(&mut inp, &mut buf)?;
+            if n == 0 {
+                break;
+            }
+            h.update(buf.get(..n).unwrap_or(&[]));
+            out.write_all(buf.get(..n).unwrap_or(&[]))?;
+        }
+        #[cfg(test)]
+        if injected(Fault::Slow) {
+            COPY_THREADS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(std::thread::current().id());
+            std::thread::sleep(std::time::Duration::from_millis(30));
+        }
+        if injected(Fault::Corrupt) {
+            out.write_all(b"!")?;
+        }
+        out.sync_all()?;
+        if let Ok(m) = fs::metadata(src).and_then(|m| m.modified()) {
+            let _ = out.set_modified(m);
+        }
+        let src_hash = h.finish();
+        if hash_file(dst)? != src_hash {
+            return Err(io::Error::other("the copy differs from the original"));
+        }
+        Ok(src_hash)
+    })();
+    drop(out);
+    if r.is_err() {
+        let _ = fs::remove_file(dst);
+    }
+    r
+}
+
 /// [`lightcraft_preview::hash_bytes`] of a file's content, read in chunks.
-fn hash_file(path: &Path) -> io::Result<lightcraft_preview::Hash128> {
+pub(crate) fn hash_file(path: &Path) -> io::Result<lightcraft_preview::Hash128> {
     let mut f = File::open(path)?;
     let mut h = lightcraft_preview::Hasher128::new();
     let mut buf = vec![0u8; 1 << 20];

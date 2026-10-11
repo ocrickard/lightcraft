@@ -132,7 +132,18 @@ fn ext_upper(name: &str) -> String {
 /// ([`lightcraft_codecs::read_header`], which refuses truncated files but can't see damage inside
 /// compressed data that is all there: such a file imports and shows as unreadable when rendered).
 pub fn probe_bytes(name: &str, bytes: &[u8]) -> Result<ProbeInfo, String> {
-    let content_hash = Some(lightcraft_preview::hash_bytes(bytes).to_string());
+    probe_bytes_impl(name, bytes, Some(lightcraft_preview::hash_bytes(bytes).to_string()))
+}
+
+/// [`probe_bytes`] without the content hash: for bytes that are not the whole file (the scan
+/// probe reads headers, not samples), where hashing would both cost the bytes saved and record
+/// the wrong hash. Callers that need the hash fill it in for the few files whose size another
+/// file shares (see [`crate::import`]).
+pub fn probe_bytes_unhashed(name: &str, bytes: &[u8]) -> Result<ProbeInfo, String> {
+    probe_bytes_impl(name, bytes, None)
+}
+
+fn probe_bytes_impl(name: &str, bytes: &[u8], content_hash: Option<String>) -> Result<ProbeInfo, String> {
     let m = lightcraft_meta::extract(bytes);
     let (meta, captured) = meta_of(&m);
     if lightcraft_raw::probe(bytes).is_some() {
@@ -805,6 +816,117 @@ fn raf_preview_extent(prefix: &[u8]) -> Option<u64> {
     (offset > 0 && len > 0).then(|| offset.checked_add(len)).flatten()
 }
 
+/// First bytes read before the header plan is asked (as in `sparse_corpus`): every format the
+/// plan covers keeps the tables that name further ranges inside it.
+const PROBE_PREFIX: u64 = 512 * 1024;
+/// Rounds of `Need` before a header plan that never settles is read whole instead.
+const PROBE_ROUNDS: usize = 64;
+
+/// What [`load_probe_bytes`] read from a file, so a caller can see what a probe cost.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ProbeRead {
+    /// Bytes read.
+    pub read: u64,
+    /// The file's size.
+    pub total: u64,
+    /// Whether the probe ran on part of the file (`false`: the whole file was read, which is
+    /// what every probe cost before the sparse path existed).
+    pub sparse: bool,
+}
+
+impl ProbeRead {
+    /// The share of the file that was read, `0.0`..=`1.0`.
+    pub fn fraction(self) -> f64 {
+        if self.total == 0 {
+            return 0.0;
+        }
+        (self.read as f64 / self.total as f64).clamp(0.0, 1.0)
+    }
+}
+
+/// Filesystem-backed import-scan probe (native): what the file's headers say, read without its
+/// pixel data.
+///
+/// A scan describes every candidate (format, dimensions, capture time, whether only its preview
+/// shows) and used to read every byte of every file to do it — 318 GB for a card of 1501
+/// Hasselblad 3FR files, about two hours at the card's speed. The headers a probe reads sit near
+/// the start of the file instead (0.3 % of those 3FR files, measured), so this loads only the
+/// ranges [`lightcraft_raw::sparse::header_plan`] names and probes that buffer. Anything the plan
+/// cannot describe from part of the file (small files, formats whose header probe reads samples,
+/// an unclear structure) is read whole, exactly as before.
+///
+/// The probe carries no content hash: hashing needs the bytes this skips. The import fills hashes
+/// in for the few files whose size another file shares — different sizes cannot hold the same
+/// bytes — and hashes the rest while copying or adding them.
+pub fn fs_scan_probe() -> FileProbe {
+    Arc::new(|path: &str| {
+        let total = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        let _permit = crate::memory::work_gate().acquire(usize::try_from(total).unwrap_or(usize::MAX));
+        let (bytes, read) = load_probe_bytes(path)?;
+        if lightcraft_pipeline::profiling() {
+            eprintln!(
+                "[profile] probe {path}: read {} of {} bytes ({:.1}%, {})",
+                read.read,
+                read.total,
+                read.fraction() * 100.0,
+                if read.sparse { "sparse" } else { "whole" }
+            );
+        }
+        if read.sparse { probe_bytes_unhashed(path, &bytes) } else { probe_bytes(path, &bytes) }
+    })
+}
+
+/// The bytes [`fs_scan_probe`] probes: the header ranges of the file in a buffer of its full
+/// length (the rest zeros), or the whole file when the header plan declines it. Also what was
+/// read, for [`ProbeRead`].
+fn load_probe_bytes(path: &str) -> Result<(Vec<u8>, ProbeRead), String> {
+    let mut file = std::fs::File::open(path).map_err(|e| format!("{path}: {e}"))?;
+    let total = file.metadata().map_err(|e| format!("{path}: {e}"))?.len();
+    load_probe_ranges(&mut file, total).map_err(|e| format!("{path}: {e}"))
+}
+
+/// [`load_probe_bytes`] over any seekable reader (tests count the bytes). A file that fits the
+/// first prefix is read whole, as is anything whose plan never settles or names a range outside
+/// the file — the probe of those is exactly the probe of a full read.
+fn load_probe_ranges<R: std::io::Read + std::io::Seek>(r: &mut R, total: u64) -> std::io::Result<(Vec<u8>, ProbeRead)> {
+    use std::io::SeekFrom;
+    let len = usize::try_from(total).map_err(|_| std::io::Error::other("file too large"))?;
+    if total <= PROBE_PREFIX {
+        let mut bytes = vec![0u8; len];
+        r.seek(SeekFrom::Start(0))?;
+        r.read_exact(&mut bytes)?;
+        return Ok((bytes, ProbeRead { read: total, total, sparse: false }));
+    }
+    let mut bytes = vec![0u8; len];
+    let mut loaded = lightcraft_raw::sparse::Ranges::new();
+    let prefix = PROBE_PREFIX as usize;
+    r.seek(SeekFrom::Start(0))?;
+    r.read_exact(&mut bytes[..prefix])?;
+    loaded.insert(0, PROBE_PREFIX);
+    let mut read = PROBE_PREFIX;
+    'plan: for _ in 0..PROBE_ROUNDS {
+        match lightcraft_raw::sparse::header_plan(&bytes, &loaded) {
+            lightcraft_raw::sparse::HeaderPlan::Need(ranges) => {
+                for &(start, end) in ranges.spans() {
+                    let (Ok(a), Ok(b)) = (usize::try_from(start), usize::try_from(end)) else { break 'plan };
+                    let Some(slot) = bytes.get_mut(a..b) else { break 'plan };
+                    if r.seek(SeekFrom::Start(start)).is_err() || r.read_exact(slot).is_err() {
+                        break 'plan;
+                    }
+                    loaded.insert(start, end);
+                    read += end.saturating_sub(start);
+                }
+            }
+            lightcraft_raw::sparse::HeaderPlan::Ready => return Ok((bytes, ProbeRead { read, total, sparse: true })),
+            lightcraft_raw::sparse::HeaderPlan::Whole(_) => break 'plan,
+        }
+    }
+    r.seek(SeekFrom::Start(0))?;
+    r.read_exact(&mut bytes)?;
+    read += total;
+    Ok((bytes, ProbeRead { read, total, sparse: false }))
+}
+
 /// The display-ready preview of a raw whose embedded JPEG was already located: the counterpart of
 /// [`embedded_preview_srgb`] for [`preview_window`], which does not re-read the container.
 /// `None` when the bytes are not a decodable image.
@@ -868,6 +990,7 @@ impl crate::Session {
         let (l, p) = fs_hooks();
         self.media.file_loader = Some(l);
         self.media.file_probe = Some(p);
+        self.media.scan_probe = Some(fs_scan_probe());
         self.media.preview_loader = Some(fs_preview_loader());
         self.media.denoise.loader = Some(fs_pair_loader());
         #[cfg(target_os = "macos")]
@@ -1014,6 +1137,83 @@ mod tests {
             }
         }
         assert!(probe_bytes("x.jpg", b"not an image").is_err());
+    }
+
+    /// A reader that counts the bytes pulled through it.
+    struct CountingReader<'a> {
+        inner: std::io::Cursor<&'a [u8]>,
+        read: u64,
+    }
+
+    impl std::io::Read for CountingReader<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = std::io::Read::read(&mut self.inner, buf)?;
+            self.read += n as u64;
+            Ok(n)
+        }
+    }
+
+    impl std::io::Seek for CountingReader<'_> {
+        fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+            std::io::Seek::seek(&mut self.inner, pos)
+        }
+    }
+
+    /// The scan probe reads a raw's headers, not its samples: a multi-megabyte DNG is described
+    /// from its first ranges, exactly as the whole-file probe describes it — minus the content
+    /// hash, which needs the bytes skipped.
+    #[test]
+    fn scan_probe_reads_headers_not_samples() {
+        let (w, h) = (2048usize, 1536usize);
+        // incompressible samples, so the compressed strips stay multi-megabyte
+        let data: Vec<u16> = (0..w * h).map(|i| (u64::try_from(i).unwrap_or(0).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 33) as u16).collect();
+        let bytes = crate::tests_xmp::synthetic_dng_of(w, h, "RGGB", data, None, Default::default());
+        assert!(bytes.len() as u64 > PROBE_PREFIX * 4, "fixture too small to prove anything: {}", bytes.len());
+        let mut counting = CountingReader { inner: std::io::Cursor::new(bytes.as_slice()), read: 0 };
+        let (sparse, probe_read) = load_probe_ranges(&mut counting, bytes.len() as u64).unwrap();
+        assert!(probe_read.sparse, "fell back to a whole read");
+        assert!(probe_read.read <= PROBE_PREFIX + 256 * 1024, "read {} of {} bytes", probe_read.read, bytes.len());
+        assert_eq!(counting.read, probe_read.read, "bytes pulled, counted twice");
+        assert_eq!(sparse.len(), bytes.len());
+        assert_ne!(&sparse, &bytes, "every byte loaded is not a sparse read");
+        let full = probe_bytes("x.dng", &bytes).unwrap();
+        let part = probe_bytes_unhashed("x.dng", &sparse).unwrap();
+        for (name, a, b) in [
+            ("width", part.width as u64, full.width as u64),
+            ("height", part.height as u64, full.height as u64),
+            ("file_size", part.file_size, full.file_size),
+        ] {
+            assert_eq!(a, b, "{name}");
+        }
+        assert_eq!((part.format, part.kind, part.preview_only), (full.format, full.kind, full.preview_only));
+        assert_eq!(part.meta, full.meta);
+        assert_eq!(part.captured, full.captured);
+        assert_eq!(part.as_shot_wb, full.as_shot_wb);
+        assert_eq!(part.content_hash, None);
+        assert!(full.content_hash.is_some());
+    }
+
+    /// What the header plan declines (here: anything but a raw layout) is read whole, so the
+    /// scan probe degrades to exactly the probe it replaces — same bytes, same verdict, hash
+    /// included.
+    #[test]
+    fn scan_probe_reads_whole_what_headers_cannot_describe() {
+        let (w, h) = (2048u32, 1536u32);
+        let rgb: Vec<u8> = (0..w * h * 3).map(|i| (i * 7 % 251) as u8).collect();
+        let img = EncodeImage::new(w, h, 3, Samples::U8(&rgb));
+        let jpeg = encode_jpeg(&img, 90, ChromaSubsampling::S420, &EncodeMeta::default()).unwrap();
+        assert!(jpeg.len() as u64 > PROBE_PREFIX, "fixture too small to prove anything: {}", jpeg.len());
+        let mut counting = CountingReader { inner: std::io::Cursor::new(jpeg.as_slice()), read: 0 };
+        let (bytes, probe_read) = load_probe_ranges(&mut counting, jpeg.len() as u64).unwrap();
+        assert!(!probe_read.sparse);
+        assert_eq!(bytes, jpeg);
+        let dir = crate::tests_xmp::temp_dir("scan-probe-whole");
+        let path = dir.join("big.jpg");
+        std::fs::write(&path, &jpeg).unwrap();
+        let p = fs_scan_probe()(&path.to_string_lossy()).unwrap();
+        assert_eq!((p.width, p.height), (w, h));
+        assert_eq!(p.content_hash, Some(lightcraft_preview::hash_bytes(&jpeg).to_string()));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Issue #548: a small preview bins the mosaic by 8; specular points that clip a single green sample

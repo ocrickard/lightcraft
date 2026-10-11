@@ -3,8 +3,9 @@
 //! 1. Expand folders recursively into supported files (hidden entries and the library's own
 //!    folder are skipped), sorted for a stable order.
 //! 2. Skip paths already in the catalog.
-//! 3. Probe the rest — dimensions, metadata, and the **content hash** of the bytes — in parallel
-//!    on native targets.
+//! 3. Probe the rest — dimensions and metadata, read from headers, not samples — in parallel
+//!    on native targets. Only files whose size another file shares are hashed then (different
+//!    sizes cannot hold the same bytes); the rest are hashed while the import copies or adds them.
 //! 4. Skip **duplicates by content** (same bytes already in the library, or twice in this batch).
 //!    A duplicate (by path or content) of a photo in Recently Deleted is restored instead, with
 //!    its edits, unless the import says otherwise ([`OnDeleted`]).
@@ -23,7 +24,7 @@
 //! and duplicate detection without adding anything, so the user can review the candidates. The
 //! probes are kept and reused by the import that follows.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use lightcraft_catalog::{MediaKind, Op, Photo, PhotoId, Source};
@@ -524,25 +525,35 @@ fn probe_all(probe: Option<&crate::media::FileProbe>, paths: &[String], progress
 }
 
 /// Copy `src` into `dir` as `name` (default: its own name), made unique with -1, -2…; returns the
-/// new path. The copy is verified ([`crate::import_move::copy_new`]: a new file, synced and
-/// checked against `probe_hash`, the content hash the probe computed — or compared byte for byte
-/// with the source when there is none); a bad one is removed and the photo reported as failed.
-fn copy_into(dir: &Path, src: &str, name: Option<&str>, probe_hash: Option<&str>) -> Result<String, String> {
+/// new path and the verified content hash. The copy is verified ([`crate::import_move::copy_new`]:
+/// a new file, synced and checked against `probe_hash`, the content hash the probe computed — or,
+/// when the scan read headers only and there is none, hashed as it streams and checked against
+/// that); a bad one is removed and the photo reported as failed.
+fn copy_into(dir: &Path, src: &str, name: Option<&str>, probe_hash: Option<&str>) -> Result<(String, String), String> {
     let name = name
         .map(str::to_string)
         .unwrap_or_else(|| Path::new(src).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "photo".into()));
-    let expect = probe_hash.and_then(lightcraft_preview::Hash128::parse);
-    crate::import_move::copy_new(Path::new(src), dir, &name, expect).map(|p| p.to_string_lossy().to_string())
+    match probe_hash.and_then(lightcraft_preview::Hash128::parse) {
+        Some(expect) => {
+            crate::import_move::copy_new(Path::new(src), dir, &name, Some(expect)).map(|p| (p.to_string_lossy().to_string(), expect.to_string()))
+        }
+        None => crate::import_move::copy_new_streaming(Path::new(src), dir, &name).map(|(p, h)| (p.to_string_lossy().to_string(), h.to_string())),
+    }
 }
 
 /// What a [`scan`] needs from the session, so it can run on another thread (a folder on a network
 /// share can take minutes to read).
 pub struct ScanInput {
     probe: Option<crate::media::FileProbe>,
+    /// The sparse probe when the session has one (native): scans prefer it over [`Self::probe`].
+    /// Tests override [`Self::probe`] only, so stubbed probes keep working.
+    scan_probe: Option<crate::media::FileProbe>,
     skip: Option<PathBuf>,
     /// path → (photo, its summary) for files already in the library.
     by_path: HashMap<PathBuf, (PhotoId, ImportCandidate)>,
     by_hash: HashMap<String, PhotoId>,
+    /// Sizes of the hashed library photos: a candidate of another size cannot duplicate one.
+    by_size: HashSet<u64>,
     cache: HashMap<String, ProbeInfo>,
 }
 
@@ -567,6 +578,7 @@ impl ScanInput {
         let skip = s.library.as_ref().filter(|l| l.on_disk).map(|l| l.dir.clone());
         let mut by_path = HashMap::new();
         let mut by_hash = HashMap::new();
+        let mut by_size = HashSet::new();
         for p in s.catalog.photos() {
             if let Source::File { path } = &p.source {
                 let c = ImportCandidate {
@@ -585,11 +597,38 @@ impl ScanInput {
             }
             if let Some(h) = &p.content_hash {
                 by_hash.insert(h.clone(), p.id);
+                by_size.insert(p.file_size);
             }
         }
-        let input = ScanInput { probe: s.media.file_probe.clone(), skip, by_path, by_hash, cache: std::mem::take(&mut s.import_probes) };
+        let input = ScanInput {
+            probe: s.media.file_probe.clone(),
+            scan_probe: s.media.scan_probe.clone(),
+            skip,
+            by_path,
+            by_hash,
+            by_size,
+            cache: std::mem::take(&mut s.import_probes),
+        };
         (input, paths.to_vec())
     }
+}
+
+/// Paths whose content hash duplicate detection needs: probed files without one whose size
+/// another candidate or a hashed library photo shares. Different sizes cannot hold the same
+/// bytes, so the sparse scan probe (which reads headers, not samples) leaves the rest unhashed
+/// and the import hashes only these — and, later, the files it actually adds or copies.
+fn needs_hash<'a>(infos: &[(&'a str, &'a ProbeInfo)], library_sizes: &HashSet<u64>) -> Vec<&'a str> {
+    let mut counts: HashMap<u64, usize> = HashMap::new();
+    for (_, info) in infos {
+        *counts.entry(info.file_size).or_default() += 1;
+    }
+    infos
+        .iter()
+        .filter(|(_, info)| {
+            info.content_hash.is_none() && (counts.get(&info.file_size).is_some_and(|&n| n > 1) || library_sizes.contains(&info.file_size))
+        })
+        .map(|(path, _)| *path)
+        .collect()
 }
 
 /// Find and probe what importing `paths` would add, marking duplicates (by path, or by content
@@ -620,11 +659,24 @@ pub fn scan_with(mut input: ScanInput, paths: &[String], progress: &ScanProgress
         .collect();
     let missing: Vec<String> = todo.iter().zip(&cached).filter(|(_, c)| c.is_none()).map(|(f, _)| f.clone()).collect();
     progress.done.store(todo.len() - missing.len(), Relaxed);
-    let mut fresh = probe_all(input.probe.as_ref(), &missing, progress).into_iter();
+    let probe = input.scan_probe.as_ref().or(input.probe.as_ref());
+    let mut fresh = probe_all(probe, &missing, progress).into_iter();
     let probed: Vec<Result<ProbeInfo, String>> =
         cached.into_iter().map(|c| c.map(Ok).unwrap_or_else(|| fresh.next().unwrap_or_else(|| Err("not probed".into())))).collect();
     crate::memory::release();
     let mut probes: HashMap<String, Result<ProbeInfo, String>> = todo.into_iter().zip(probed).collect();
+    // The sparse probe reads headers, not samples, so most probes arrive unhashed: hash the few
+    // whose size another file shares (the only ones duplicate detection can match). A file that
+    // cannot be read for its hash stays unhashed; the import reports it when it reads the file.
+    let sizes: Vec<(&str, &ProbeInfo)> = probes.iter().filter_map(|(p, r)| r.as_ref().ok().map(|i| (p.as_str(), i))).collect();
+    let fill: Vec<String> = needs_hash(&sizes, &input.by_size).into_iter().map(str::to_string).collect();
+    for path in &fill {
+        if let Ok(h) = crate::import_move::hash_file(Path::new(path))
+            && let Some(Ok(info)) = probes.get_mut(path)
+        {
+            info.content_hash = Some(h.to_string());
+        }
+    }
     let mut seen_hash: HashMap<String, Option<u64>> = input.by_hash.into_iter().map(|(h, id)| (h, Some(id.0))).collect();
     let mut out = Vec::with_capacity(files.len());
     let mut kept = HashMap::new();
@@ -695,7 +747,10 @@ pub struct ImportJob {
     by_path: HashMap<String, (PhotoId, bool)>,
     /// content hash → the photo that has it (`None`: a file earlier in this import)
     by_hash: HashMap<String, Option<PhotoId>>,
+    /// sizes of the hashed library photos a candidate could duplicate (see [`needs_hash`]).
+    library_sizes: HashSet<u64>,
     probe: Option<crate::media::FileProbe>,
+    scan_probe: Option<crate::media::FileProbe>,
     file_bytes: Option<crate::merge::ByteReader>,
     /// Probes from a preceding scan (not read again).
     cache: HashMap<String, ProbeInfo>,
@@ -830,6 +885,7 @@ impl ImportJob {
         }
         let mut by_path = HashMap::new();
         let mut by_hash = HashMap::new();
+        let mut library_sizes = HashSet::new();
         for p in s.catalog.photos() {
             // a trashed photo is replaced by a fresh import, so it doesn't count as a duplicate
             if p.deleted && opts.on_deleted == OnDeleted::Fresh {
@@ -840,6 +896,7 @@ impl ImportJob {
             }
             if let Some(h) = &p.content_hash {
                 by_hash.insert(h.clone(), Some(p.id));
+                library_sizes.insert(p.file_size);
             }
         }
         Ok(ImportJob {
@@ -850,7 +907,9 @@ impl ImportJob {
             copy_root,
             by_path,
             by_hash,
+            library_sizes,
             probe: s.media.file_probe.clone(),
+            scan_probe: s.media.scan_probe.clone(),
             file_bytes: s.media.file_bytes.clone(),
             cache: std::mem::take(&mut s.import_probes),
             naming: s.xmp.naming,
@@ -918,15 +977,33 @@ impl ImportJob {
             .collect();
         let missing: Vec<String> = todo.iter().zip(&cached).filter(|(_, c)| c.is_none()).map(|(f, _)| f.clone()).collect();
         let progress = ScanProgress::default();
-        let mut fresh = probe_all(self.probe.as_ref(), &missing, &progress).into_iter();
+        let probe = self.scan_probe.as_ref().or(self.probe.as_ref());
+        let mut fresh = probe_all(probe, &missing, &progress).into_iter();
         let probed: Vec<Result<ProbeInfo, String>> =
             cached.into_iter().map(|c| c.map(Ok).unwrap_or_else(|| fresh.next().unwrap_or_else(|| Err("not probed".into())))).collect();
         crate::memory::release();
+        // The sparse probe reads headers, not samples: hash the files duplicate detection can
+        // match before planning, as the scan does. A file that cannot be read fails here, as a
+        // probe that read it whole would have failed.
+        let sizes: Vec<(&str, &ProbeInfo)> = todo.iter().zip(probed.iter()).filter_map(|(p, r)| r.as_ref().ok().map(|i| (p.as_str(), i))).collect();
+        let fill: HashSet<String> = needs_hash(&sizes, &self.library_sizes).into_iter().map(str::to_string).collect();
+        let mut probed: Vec<(String, Result<ProbeInfo, String>)> = todo.into_iter().zip(probed).collect();
+        for (path, info) in &mut probed {
+            if !fill.contains(path) {
+                continue;
+            }
+            if let Ok(i) = info {
+                match crate::import_move::hash_file(Path::new(path)) {
+                    Ok(h) => i.content_hash = Some(h.to_string()),
+                    Err(e) => *info = Err(format!("{path}: {e}")),
+                }
+            }
+        }
         // Files are planned one by one, in order (duplicates, sidecars, names, folders); their
         // copies or moves — the slow part, reading and writing every byte and verifying it — are
         // collected and run on several threads (issue #367), then their outcomes take their places.
         let mut plan = Plan::default();
-        for (path, info) in todo.into_iter().zip(probed) {
+        for (path, info) in probed {
             if cancel.load(Relaxed) {
                 break;
             }
@@ -1023,6 +1100,19 @@ impl ImportJob {
                 }
                 _ => path.clone(),
             };
+            // Added in place (no copy reads the file): the catalog record keeps a content
+            // hash, as it did when the scan read every file whole. Copies hash while streaming.
+            if info.content_hash.is_none() {
+                match crate::import_move::hash_file(Path::new(&path)) {
+                    Ok(h) => info.content_hash = Some(h.to_string()),
+                    Err(e) => {
+                        log::warn!("import {path}: {e}");
+                        self.done.fetch_add(1, Relaxed);
+                        plan.slots.push(Slot::Item(PreparedItem::Failed(path, e.to_string())));
+                        continue;
+                    }
+                }
+            }
             if let Some(h) = &info.content_hash {
                 self.by_hash.insert(h.clone(), None);
             }
@@ -1194,6 +1284,14 @@ fn run_transfer(t: Transfer, file_bytes: Option<&crate::merge::ByteReader>) -> P
     let mut stored = match how {
         How::Place { name } => match crate::import_move::place(Path::new(&path), &dir, &name) {
             Ok(pl) => {
+                // The placed bytes are verified: hash the destination (local, fast) for the
+                // catalog record when the probe read headers only. A hash that cannot be read
+                // leaves the photo unhashed rather than failing a verified move.
+                if info.content_hash.is_none()
+                    && let Ok(h) = crate::import_move::hash_file(&pl.dst)
+                {
+                    info.content_hash = Some(h.to_string());
+                }
                 let dst = pl.dst.to_string_lossy().to_string();
                 placed = Some(pl);
                 dst
@@ -1201,7 +1299,10 @@ fn run_transfer(t: Transfer, file_bytes: Option<&crate::merge::ByteReader>) -> P
             Err(e) => return PreparedItem::Failed(path, e),
         },
         How::Copy { name } => match copy_into(&dir, &path, name.as_deref(), info.content_hash.as_deref()) {
-            Ok(p) => p,
+            Ok((p, hash)) => {
+                info.content_hash = Some(hash);
+                p
+            }
             Err(e) => return PreparedItem::Failed(path, e),
         },
     };
@@ -1497,5 +1598,19 @@ mod prepared_tests {
         prepared.revalidate_add(&s);
         assert!(matches!(prepared.items.first(), Some(PreparedItem::Duplicate { reason: "path", .. })));
         assert!(matches!(prepared.items.get(1), Some(PreparedItem::Ready(_))));
+    }
+
+    #[test]
+    fn needs_hash_only_where_a_duplicate_is_possible() {
+        let info = |size: u64, hash: Option<&str>| ProbeInfo { file_size: size, content_hash: hash.map(str::to_string), ..ProbeInfo::default() };
+        let (a, b, c) = (info(10, None), info(10, None), info(11, None));
+        // two candidates share a size: both hash, so they can match each other
+        assert_eq!(needs_hash(&[("a", &a), ("b", &b), ("c", &c)], &HashSet::new()), vec!["a", "b"]);
+        // a library photo of the same size pulls an otherwise unique file in
+        assert_eq!(needs_hash(&[("c", &c)], &HashSet::from([11])), vec!["c"]);
+        assert!(needs_hash(&[("c", &c)], &HashSet::from([12])).is_empty());
+        // already hashed (whole-file probes, small files): nothing to do
+        let h = info(10, Some("abc"));
+        assert!(needs_hash(&[("h", &h)], &HashSet::from([10])).is_empty());
     }
 }

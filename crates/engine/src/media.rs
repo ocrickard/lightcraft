@@ -321,6 +321,10 @@ pub struct MediaCache {
     budget: usize,
     pub file_loader: Option<FileLoader>,
     pub file_probe: Option<FileProbe>,
+    /// The scan probe ([`crate::files::fs_scan_probe`]): headers without samples, and no content
+    /// hash. Scans prefer it over [`Self::file_probe`]; anything that compares hashes (reload,
+    /// relink) keeps the full probe.
+    pub scan_probe: Option<FileProbe>,
     pub preview_loader: Option<PreviewLoader>,
     /// Reads a photo file's bytes (Photo Merge); `None` = the local file system.
     pub file_bytes: Option<crate::merge::ByteReader>,
@@ -395,6 +399,7 @@ impl Default for MediaCache {
             budget,
             file_loader: None,
             file_probe: None,
+            scan_probe: None,
             preview_loader: None,
             file_bytes: None,
             smart_dir: None,

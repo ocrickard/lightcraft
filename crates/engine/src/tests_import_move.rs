@@ -236,6 +236,42 @@ fn copy_is_verified_against_the_probe_hash() {
     let _ = std::fs::remove_dir_all(&base);
 }
 
+/// Copies without a probe hash (the scan reads headers only now) hash the source as it streams:
+/// a good copy verifies against that, corruption is caught, and failures leave nothing.
+#[test]
+fn streaming_copy_verifies_without_a_probe_hash() {
+    use crate::import_move::copy_new_streaming;
+    let base = temp_dir("streamcopy");
+    let src = base.join("src.bin");
+    // larger than one 1 MB read, not a multiple of it
+    let bytes: Vec<u8> = (0..(3 << 20) + 12_345u32).map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8).collect();
+    std::fs::write(&src, &bytes).unwrap();
+    let want = lightcraft_preview::hash_bytes(&bytes);
+    let (dst, h) = copy_new_streaming(&src, &base, "ok.bin").unwrap();
+    assert_eq!(std::fs::read(&dst).unwrap(), bytes);
+    assert_eq!(h, want, "the verified hash is the source's");
+    // a taken name moves on, as the hashed copy does
+    std::fs::write(base.join("taken.bin"), b"someone else's file").unwrap();
+    let (dst2, h2) = copy_new_streaming(&src, &base, "taken.bin").unwrap();
+    assert!(dst2.file_name().unwrap_or_default().to_string_lossy().starts_with("taken-1"));
+    assert_eq!(h2, want);
+    assert_eq!(std::fs::read(base.join("taken.bin")).unwrap(), b"someone else's file");
+    // a copy that comes out different: caught
+    inject(Fault::Corrupt);
+    let r = copy_new_streaming(&src, &base, "bad.bin");
+    inject(Fault::None);
+    assert!(r.is_err());
+    assert!(!base.join("bad.bin").exists());
+    // a write that fails half-way: cleaned up
+    inject(Fault::FailWrite);
+    let r = copy_new_streaming(&src, &base, "half.bin");
+    inject(Fault::None);
+    assert!(r.is_err());
+    assert!(!base.join("half.bin").exists());
+    assert_eq!(std::fs::read(&src).unwrap(), bytes, "the source is untouched");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
 /// A file replaced after Review Import probed it is not imported on the strength of the old probe:
 /// its copy no longer matches the probe's hash, so it's reported as failed and nothing is left.
 #[test]

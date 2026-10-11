@@ -231,6 +231,11 @@ fn tiff_plan(bytes: &[u8], loaded: &Ranges, preview: bool) -> HeaderPlan {
         return HeaderPlan::Whole("its header probe reads samples");
     }
     let Ok(tiff) = Tiff::parse(bytes) else { return HeaderPlan::Whole("TIFF structure") };
+    // ARW6 probes as Arw, but its header probe validates the tile tables of the whole strip
+    // (arw6::decode), so it reads samples too. (corpus: arw6-sony-ilce7rm6-apsc-land-hq.arw)
+    if tiff.all_ifds().into_iter().any(|i| i.u16(t::COMPRESSION) == Some(32766)) {
+        return HeaderPlan::Whole("its header probe reads the ARW6 stream");
+    }
     let mut holes = Ranges::new();
     for ifd in tiff.all_ifds() {
         let chunks: Vec<(u64, u64)> = match ifd.image() {
