@@ -15,14 +15,27 @@ whole, exactly as before:
 - an unclear structure (the plan never guesses).
 
 Measured on the card above: 593,408 of 212,680,704 bytes per file (0.3 %), three cold files in
-52 ms instead of ~15 s — about 300× faster, the full card in under a minute.
+52 ms instead of ~15 s — about 300× faster.
 
 ## Content hashes
 
 The scan probe carries no content hash: hashing needs the bytes it skips. Duplicate detection
-still matches by content, because only files whose size another file shares are hashed during
-the scan — different sizes cannot hold the same bytes. The rest are hashed while the import
-reads them anyway:
+still matches by content, but size alone is a weak filter — on the card above, 1396 of the
+1501 files share their size with another file, so hashing every size-sharer still read
+~295 GB whole, sequentially, behind a frozen counter.
+
+The hash fill therefore compares a 64 KB head sample first and groups files by (size,
+sample): only a group that could hold duplicates — two candidates, or a candidate and a
+library file — is hashed whole to confirm it. Anything else certainly differs. The library's
+own files of those sizes are sampled the same way (local reads); sizes that cannot be
+sampled (no file, or an unreadable one) fall back to whole hashes, compared against the
+stored ones. Small files hash from their sample read. The samples and the confirmations run
+several at once, counted on the scan's progress, and stop when it is cancelled.
+
+End to end — probe, samples, and (on the card above: zero) confirmations — the 1501-file
+card scans in ~41 s.
+
+The rest are hashed while the import reads them anyway:
 
 - *copy*: the source is hashed as it streams into the copy, and the copy is hashed back and
   compared (`copy_streaming_verified`) — one read of the source instead of two;

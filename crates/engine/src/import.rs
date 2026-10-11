@@ -4,8 +4,9 @@
 //!    folder are skipped), sorted for a stable order.
 //! 2. Skip paths already in the catalog.
 //! 3. Probe the rest — dimensions and metadata, read from headers, not samples — in parallel
-//!    on native targets. Only files whose size another file shares are hashed then (different
-//!    sizes cannot hold the same bytes); the rest are hashed while the import copies or adds them.
+//!    on native targets. Files whose size another file shares are told apart by a head sample
+//!    first; only files the samples cannot tell apart hash whole. The rest are hashed while the
+//!    import copies or adds them.
 //! 4. Skip **duplicates by content** (same bytes already in the library, or twice in this batch).
 //!    A duplicate (by path or content) of a photo in Recently Deleted is restored instead, with
 //!    its edits, unless the import says otherwise ([`OnDeleted`]).
@@ -524,6 +525,55 @@ fn probe_all(probe: Option<&crate::media::FileProbe>, paths: &[String], progress
         .collect()
 }
 
+/// Run `f` over `items` — several at once on native targets, one by one on wasm — counting
+/// each finished item on `progress.done`. Stops starting new items once `cancel` is set; those
+/// come back `None`. Callers add `items.len()` to `progress.total` first.
+fn par_map<T: Sync, R: Send>(
+    items: &[T],
+    progress: &ScanProgress,
+    cancel: &std::sync::atomic::AtomicBool,
+    f: impl Fn(&T) -> R + Sync,
+) -> Vec<Option<R>> {
+    use std::sync::atomic::Ordering::Relaxed;
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let n = workers(items.len());
+        if n > 1 {
+            let mut results: Vec<Option<R>> = Vec::with_capacity(items.len());
+            results.resize_with(items.len(), || None);
+            let next = std::sync::atomic::AtomicUsize::new(0);
+            let out = std::sync::Mutex::new(&mut results);
+            std::thread::scope(|sc| {
+                for _ in 0..n {
+                    sc.spawn(|| {
+                        loop {
+                            let i = next.fetch_add(1, Relaxed);
+                            if i >= items.len() || cancel.load(Relaxed) {
+                                break;
+                            }
+                            let r = f(&items[i]);
+                            progress.done.fetch_add(1, Relaxed);
+                            out.lock().unwrap_or_else(|e| e.into_inner())[i] = Some(r);
+                        }
+                    });
+                }
+            });
+            return results;
+        }
+    }
+    items
+        .iter()
+        .map(|t| {
+            if cancel.load(Relaxed) {
+                return None;
+            }
+            let r = f(t);
+            progress.done.fetch_add(1, Relaxed);
+            Some(r)
+        })
+        .collect()
+}
+
 /// Copy `src` into `dir` as `name` (default: its own name), made unique with -1, -2…; returns the
 /// new path and the verified content hash. The copy is verified ([`crate::import_move::copy_new`]:
 /// a new file, synced and checked against `probe_hash`, the content hash the probe computed — or,
@@ -554,6 +604,9 @@ pub struct ScanInput {
     by_hash: HashMap<String, PhotoId>,
     /// Sizes of the hashed library photos: a candidate of another size cannot duplicate one.
     by_size: HashSet<u64>,
+    /// Paths of the hashed library photos by size: the hash fill samples these (local reads)
+    /// so a candidate matches the library by content only when its head sample does.
+    library_files: HashMap<u64, Vec<PathBuf>>,
     cache: HashMap<String, ProbeInfo>,
 }
 
@@ -579,6 +632,7 @@ impl ScanInput {
         let mut by_path = HashMap::new();
         let mut by_hash = HashMap::new();
         let mut by_size = HashSet::new();
+        let mut library_files: HashMap<u64, Vec<PathBuf>> = HashMap::new();
         for p in s.catalog.photos() {
             if let Source::File { path } = &p.source {
                 let c = ImportCandidate {
@@ -594,6 +648,9 @@ impl ScanInput {
                     ..Default::default()
                 };
                 by_path.insert(PathBuf::from(path), (p.id, c));
+                if p.content_hash.is_some() {
+                    library_files.entry(p.file_size).or_default().push(PathBuf::from(path));
+                }
             }
             if let Some(h) = &p.content_hash {
                 by_hash.insert(h.clone(), p.id);
@@ -607,17 +664,18 @@ impl ScanInput {
             by_path,
             by_hash,
             by_size,
+            library_files,
             cache: std::mem::take(&mut s.import_probes),
         };
         (input, paths.to_vec())
     }
 }
 
-/// Paths whose content hash duplicate detection needs: probed files without one whose size
-/// another candidate or a hashed library photo shares. Different sizes cannot hold the same
-/// bytes, so the sparse scan probe (which reads headers, not samples) leaves the rest unhashed
-/// and the import hashes only these — and, later, the files it actually adds or copies.
-fn needs_hash<'a>(infos: &[(&'a str, &'a ProbeInfo)], library_sizes: &HashSet<u64>) -> Vec<&'a str> {
+/// Paths (with probed sizes) whose content hash duplicate detection might need: probed
+/// files without one whose size another candidate or a hashed library photo shares — different
+/// sizes cannot hold the same bytes. The hash fill samples these first and reads whole only
+/// what the samples cannot tell apart.
+fn needs_hash<'a>(infos: &[(&'a str, &'a ProbeInfo)], library_sizes: &HashSet<u64>) -> Vec<(&'a str, u64)> {
     let mut counts: HashMap<u64, usize> = HashMap::new();
     for (_, info) in infos {
         *counts.entry(info.file_size).or_default() += 1;
@@ -627,8 +685,142 @@ fn needs_hash<'a>(infos: &[(&'a str, &'a ProbeInfo)], library_sizes: &HashSet<u6
         .filter(|(_, info)| {
             info.content_hash.is_none() && (counts.get(&info.file_size).is_some_and(|&n| n > 1) || library_sizes.contains(&info.file_size))
         })
-        .map(|(path, _)| *path)
+        .map(|(path, info)| (*path, info.file_size))
         .collect()
+}
+
+/// Head bytes the hash fill compares before reading any file whole: files whose size another
+/// file shares are grouped by (size, sample), and only a group that could hold duplicates — two
+/// candidates, or a candidate and a library file — is hashed to confirm it. Anything else
+/// certainly differs, so a card of same-size raws costs small reads, not full ones.
+const HASH_SAMPLE: u64 = 64 * 1024;
+
+/// The first [`HASH_SAMPLE`] bytes of `path`, hashed — and whether that was the whole file (a
+/// short read: then the sample hash *is* its content hash). A file of exactly [`HASH_SAMPLE`]
+/// bytes reads full but looks sampled; it joins a confirm group like any other sample.
+fn sample_head(path: &Path) -> std::io::Result<(bool, lightcraft_preview::Hash128)> {
+    use std::io::Read as _;
+    let mut buf = Vec::new();
+    std::fs::File::open(path)?.take(HASH_SAMPLE).read_to_end(&mut buf)?;
+    let whole = (buf.len() as u64) < HASH_SAMPLE;
+    Ok((whole, lightcraft_preview::hash_bytes(&buf)))
+}
+
+/// What the hash fill knows about the library's files of the sizes it must match: head samples
+/// of the files it could read, and the sizes it could not sample (no file, or an unreadable
+/// one) — candidates of those sizes hash whole, compared against the stored hashes.
+struct LibrarySamples {
+    sampled: HashMap<u64, HashSet<lightcraft_preview::Hash128>>,
+    unsampled: HashSet<u64>,
+}
+
+/// Sample the library's hashed files of `sizes` (local reads, several at once), counting on
+/// `progress`. Sizes with no file, an unreadable file, or a read `cancel` skipped stay
+/// unsampled: candidates of those sizes hash whole instead.
+fn sample_library(
+    files: &HashMap<u64, Vec<PathBuf>>,
+    sizes: &HashSet<u64>,
+    progress: &ScanProgress,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> LibrarySamples {
+    use std::sync::atomic::Ordering::Relaxed;
+    let mut unsampled: HashSet<u64> = sizes.iter().filter(|s| !files.contains_key(*s)).copied().collect();
+    let mut jobs: Vec<(u64, &PathBuf)> = Vec::new();
+    for size in sizes {
+        if let Some(paths) = files.get(size) {
+            jobs.extend(paths.iter().map(|p| (*size, p)));
+        }
+    }
+    progress.total.fetch_add(jobs.len(), Relaxed);
+    let mut sampled: HashMap<u64, HashSet<lightcraft_preview::Hash128>> = HashMap::new();
+    for (r, (size, _)) in par_map(&jobs, progress, cancel, |(_, p)| sample_head(p)).into_iter().zip(jobs.iter()) {
+        match r {
+            Some(Ok((_, h))) => {
+                sampled.entry(*size).or_default().insert(h);
+            }
+            _ => {
+                unsampled.insert(*size);
+            }
+        }
+    }
+    // a size one file failed to sample is matched by whole hashes, not by samples
+    sampled.retain(|size, _| !unsampled.contains(size));
+    LibrarySamples { sampled, unsampled }
+}
+
+/// The sampled candidates that need a full content hash: same (size, sample) as another
+/// candidate (a possible duplicate to confirm), or matching the library — a sampled size whose
+/// samples include it, or an unsampled size (compared against the stored hashes).
+fn plan_hashes(samples: &HashMap<String, (u64, lightcraft_preview::Hash128)>, library: &LibrarySamples) -> HashSet<String> {
+    let mut counts: HashMap<(u64, lightcraft_preview::Hash128), usize> = HashMap::new();
+    for (size, sample) in samples.values() {
+        *counts.entry((*size, *sample)).or_default() += 1;
+    }
+    samples
+        .iter()
+        .filter(|(_, (size, sample))| {
+            counts.get(&(*size, *sample)).is_some_and(|&n| n > 1)
+                || library.unsampled.contains(size)
+                || library.sampled.get(size).is_some_and(|s| s.contains(sample))
+        })
+        .map(|(path, _)| path.clone())
+        .collect()
+}
+
+/// Hash the unhashed size-sharers duplicate detection can match (`todo`: path and probed size),
+/// reading whole only the files that could actually be duplicates: same size *and* same head
+/// sample as another candidate or a library file. Small files hash from their sample read.
+/// Reads run several at once, counted on `progress`; nothing new starts once `cancel` is set.
+/// Each path's content hash, or why it has none (`"cancelled"` for the unstarted).
+fn fill_hashes(
+    todo: &[(&str, u64)],
+    library_files: &HashMap<u64, Vec<PathBuf>>,
+    library_sizes: &HashSet<u64>,
+    progress: &ScanProgress,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> HashMap<String, Result<String, String>> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let mut out: HashMap<String, Result<String, String>> = HashMap::with_capacity(todo.len());
+    if todo.is_empty() {
+        return out;
+    }
+    // the library's files of the sizes that could match (local reads)
+    let sizes: HashSet<u64> = todo.iter().map(|(_, s)| *s).filter(|s| library_sizes.contains(s)).collect();
+    let library = sample_library(library_files, &sizes, progress, cancel);
+    // the candidates' head samples (small reads off the card)
+    progress.total.fetch_add(todo.len(), Relaxed);
+    let mut samples: HashMap<String, (u64, lightcraft_preview::Hash128)> = HashMap::with_capacity(todo.len());
+    for (r, (path, size)) in par_map(todo, progress, cancel, |(p, _)| sample_head(Path::new(p))).into_iter().zip(todo.iter()) {
+        match r {
+            Some(Ok((true, h))) => {
+                out.insert(path.to_string(), Ok(h.to_string()));
+            }
+            Some(Ok((false, h))) => {
+                samples.insert(path.to_string(), (*size, h));
+            }
+            Some(Err(e)) => {
+                out.insert(path.to_string(), Err(format!("{path}: {e}")));
+            }
+            None => {
+                out.insert(path.to_string(), Err("cancelled".into()));
+            }
+        }
+    }
+    // only sample collisions read whole, to confirm (or deny) the duplicate
+    let mut confirm: Vec<String> = plan_hashes(&samples, &library).into_iter().collect();
+    confirm.sort();
+    progress.total.fetch_add(confirm.len(), Relaxed);
+    for (r, path) in par_map(&confirm, progress, cancel, |p| crate::import_move::hash_file(Path::new(p))).into_iter().zip(confirm.iter()) {
+        out.insert(
+            path.clone(),
+            match r {
+                Some(Ok(h)) => Ok(h.to_string()),
+                Some(Err(e)) => Err(format!("{path}: {e}")),
+                None => Err("cancelled".into()),
+            },
+        );
+    }
+    out
 }
 
 /// Find and probe what importing `paths` would add, marking duplicates (by path, or by content
@@ -665,16 +857,18 @@ pub fn scan_with(mut input: ScanInput, paths: &[String], progress: &ScanProgress
         cached.into_iter().map(|c| c.map(Ok).unwrap_or_else(|| fresh.next().unwrap_or_else(|| Err("not probed".into())))).collect();
     crate::memory::release();
     let mut probes: HashMap<String, Result<ProbeInfo, String>> = todo.into_iter().zip(probed).collect();
-    // The sparse probe reads headers, not samples, so most probes arrive unhashed: hash the few
-    // whose size another file shares (the only ones duplicate detection can match). A file that
-    // cannot be read for its hash stays unhashed; the import reports it when it reads the file.
+    // The sparse probe reads headers, not samples, so most probes arrive unhashed: hash
+    // what duplicate detection can match, reading whole only what head samples cannot tell
+    // apart (several at once, counted on `progress`, stopping when it is cancelled). A file
+    // that cannot be read for its hash stays unhashed; the import reports it when it reads it.
     let sizes: Vec<(&str, &ProbeInfo)> = probes.iter().filter_map(|(p, r)| r.as_ref().ok().map(|i| (p.as_str(), i))).collect();
-    let fill: Vec<String> = needs_hash(&sizes, &input.by_size).into_iter().map(str::to_string).collect();
-    for path in &fill {
-        if let Ok(h) = crate::import_move::hash_file(Path::new(path))
+    let fill = needs_hash(&sizes, &input.by_size);
+    let hashes = fill_hashes(&fill, &input.library_files, &input.by_size, progress, &progress.cancel);
+    for (path, r) in &hashes {
+        if let Ok(h) = r
             && let Some(Ok(info)) = probes.get_mut(path)
         {
-            info.content_hash = Some(h.to_string());
+            info.content_hash = Some(h.clone());
         }
     }
     let mut seen_hash: HashMap<String, Option<u64>> = input.by_hash.into_iter().map(|(h, id)| (h, Some(id.0))).collect();
@@ -749,6 +943,8 @@ pub struct ImportJob {
     by_hash: HashMap<String, Option<PhotoId>>,
     /// sizes of the hashed library photos a candidate could duplicate (see [`needs_hash`]).
     library_sizes: HashSet<u64>,
+    /// paths of those photos by size, for the hash fill's library samples (see [`ScanInput`]).
+    library_files: HashMap<u64, Vec<PathBuf>>,
     probe: Option<crate::media::FileProbe>,
     scan_probe: Option<crate::media::FileProbe>,
     file_bytes: Option<crate::merge::ByteReader>,
@@ -886,6 +1082,7 @@ impl ImportJob {
         let mut by_path = HashMap::new();
         let mut by_hash = HashMap::new();
         let mut library_sizes = HashSet::new();
+        let mut library_files: HashMap<u64, Vec<PathBuf>> = HashMap::new();
         for p in s.catalog.photos() {
             // a trashed photo is replaced by a fresh import, so it doesn't count as a duplicate
             if p.deleted && opts.on_deleted == OnDeleted::Fresh {
@@ -893,6 +1090,9 @@ impl ImportJob {
             }
             if let Source::File { path } = &p.source {
                 by_path.insert(path.clone(), (p.id, p.local));
+                if p.content_hash.is_some() {
+                    library_files.entry(p.file_size).or_default().push(PathBuf::from(path));
+                }
             }
             if let Some(h) = &p.content_hash {
                 by_hash.insert(h.clone(), Some(p.id));
@@ -908,6 +1108,7 @@ impl ImportJob {
             by_path,
             by_hash,
             library_sizes,
+            library_files,
             probe: s.media.file_probe.clone(),
             scan_probe: s.media.scan_probe.clone(),
             file_bytes: s.media.file_bytes.clone(),
@@ -983,20 +1184,22 @@ impl ImportJob {
             cached.into_iter().map(|c| c.map(Ok).unwrap_or_else(|| fresh.next().unwrap_or_else(|| Err("not probed".into())))).collect();
         crate::memory::release();
         // The sparse probe reads headers, not samples: hash the files duplicate detection can
-        // match before planning, as the scan does. A file that cannot be read fails here, as a
-        // probe that read it whole would have failed.
+        // match before planning, as the scan does — whole reads only for what head samples
+        // cannot tell apart, stopping when `cancel` is set. A file that cannot be read fails
+        // here, as a probe that read it whole would have failed.
         let sizes: Vec<(&str, &ProbeInfo)> = todo.iter().zip(probed.iter()).filter_map(|(p, r)| r.as_ref().ok().map(|i| (p.as_str(), i))).collect();
-        let fill: HashSet<String> = needs_hash(&sizes, &self.library_sizes).into_iter().map(str::to_string).collect();
+        let fill = needs_hash(&sizes, &self.library_sizes);
+        let hashes = fill_hashes(&fill, &self.library_files, &self.library_sizes, &progress, cancel);
         let mut probed: Vec<(String, Result<ProbeInfo, String>)> = todo.into_iter().zip(probed).collect();
         for (path, info) in &mut probed {
-            if !fill.contains(path) {
-                continue;
-            }
-            if let Ok(i) = info {
-                match crate::import_move::hash_file(Path::new(path)) {
-                    Ok(h) => i.content_hash = Some(h.to_string()),
-                    Err(e) => *info = Err(format!("{path}: {e}")),
+            match hashes.get(path) {
+                Some(Ok(h)) => {
+                    if let Ok(i) = info {
+                        i.content_hash = Some(h.clone());
+                    }
                 }
+                Some(Err(e)) => *info = Err(e.clone()),
+                None => {}
             }
         }
         // Files are planned one by one, in order (duplicates, sidecars, names, folders); their
@@ -1605,12 +1808,67 @@ mod prepared_tests {
         let info = |size: u64, hash: Option<&str>| ProbeInfo { file_size: size, content_hash: hash.map(str::to_string), ..ProbeInfo::default() };
         let (a, b, c) = (info(10, None), info(10, None), info(11, None));
         // two candidates share a size: both hash, so they can match each other
-        assert_eq!(needs_hash(&[("a", &a), ("b", &b), ("c", &c)], &HashSet::new()), vec!["a", "b"]);
+        assert_eq!(needs_hash(&[("a", &a), ("b", &b), ("c", &c)], &HashSet::new()), vec![("a", 10), ("b", 10)]);
         // a library photo of the same size pulls an otherwise unique file in
-        assert_eq!(needs_hash(&[("c", &c)], &HashSet::from([11])), vec!["c"]);
+        assert_eq!(needs_hash(&[("c", &c)], &HashSet::from([11])), vec![("c", 11)]);
         assert!(needs_hash(&[("c", &c)], &HashSet::from([12])).is_empty());
         // already hashed (whole-file probes, small files): nothing to do
         let h = info(10, Some("abc"));
         assert!(needs_hash(&[("h", &h)], &HashSet::from([10])).is_empty());
+    }
+
+    #[test]
+    fn sample_head_hashes_a_prefix_and_spots_a_whole_file() {
+        let d = std::env::temp_dir().join(format!("lc-sample-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let bytes: Vec<u8> = (0..200_000u32).map(|i| (i.wrapping_mul(0x9E37_79B9) >> 13) as u8).collect();
+        std::fs::write(d.join("big.bin"), &bytes).unwrap();
+        let (whole, h) = sample_head(&d.join("big.bin")).unwrap();
+        assert!(!whole, "200 KB clears the 64 KB sample");
+        assert_eq!(h, lightcraft_preview::hash_bytes(&bytes[..64 * 1024]));
+        std::fs::write(d.join("small.bin"), b"tiny").unwrap();
+        let (whole, h) = sample_head(&d.join("small.bin")).unwrap();
+        assert!(whole, "a short read is the whole file");
+        assert_eq!(h, lightcraft_preview::hash_bytes(b"tiny"));
+        assert!(sample_head(&d.join("missing.bin")).is_err());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn plan_hashes_only_sample_collisions_and_library_matches() {
+        use lightcraft_preview::Hash128;
+        let (h1, h2) = (Hash128(1), Hash128(2));
+        let samples = HashMap::from([
+            ("a".to_string(), (100u64, h1)),
+            ("b".to_string(), (100, h1)), // same size + sample: confirm
+            ("c".to_string(), (100, h2)), // same size, other sample: ruled out
+            ("d".to_string(), (200, h2)), // a sampled library file holds this sample: confirm
+            ("e".to_string(), (300, h2)), // an unsampled library size: confirm
+            ("f".to_string(), (400, h2)), // nothing matches: ruled out
+        ]);
+        let library = LibrarySamples {
+            sampled: HashMap::from([(200u64, HashSet::from([h2])), (100u64, HashSet::from([Hash128(9)]))]),
+            unsampled: HashSet::from([300u64]),
+        };
+        assert_eq!(plan_hashes(&samples, &library), HashSet::from(["a".to_string(), "b".to_string(), "d".to_string(), "e".to_string()]));
+    }
+
+    #[test]
+    fn fill_hashes_stops_when_cancelled() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let d = std::env::temp_dir().join(format!("lc-fillcancel-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let (a, b) = (d.join("a.png"), d.join("b.png"));
+        std::fs::write(&a, vec![1u8; 70_000]).unwrap();
+        std::fs::write(&b, vec![2u8; 70_000]).unwrap();
+        let (a, b) = (a.to_string_lossy().to_string(), b.to_string_lossy().to_string());
+        let progress = ScanProgress::default();
+        let out = fill_hashes(&[(a.as_str(), 70_000), (b.as_str(), 70_000)], &HashMap::new(), &HashSet::new(), &progress, &AtomicBool::new(true));
+        assert_eq!(out.len(), 2);
+        assert!(out.values().all(|r| r.as_ref().is_err_and(|e| e == "cancelled")), "{out:?}");
+        assert_eq!(progress.done.load(Ordering::Relaxed), 0, "nothing started, nothing counted");
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

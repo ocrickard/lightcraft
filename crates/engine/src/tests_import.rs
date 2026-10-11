@@ -138,6 +138,123 @@ fn add_import_hashes_what_the_scan_left_unhashed() {
     let _ = std::fs::remove_dir_all(&elsewhere);
 }
 
+/// A probe that describes without reading (the fixtures are not real PNGs): size only,
+/// unhashed, like the sparse probe on files that clear the header plan.
+fn size_probe() -> crate::media::FileProbe {
+    std::sync::Arc::new(|p: &str| {
+        Ok(crate::media::ProbeInfo {
+            file_size: std::fs::metadata(p).map(|m| m.len()).unwrap_or(0),
+            format: "PNG".into(),
+            width: 48,
+            height: 32,
+            ..Default::default()
+        })
+    })
+}
+
+/// Same-size files the scan probe leaves unhashed are told apart by head samples: only a
+/// sample collision reads whole. Twins still match by content; a same-size file with another
+/// head stays unhashed and stands; small files hash from their sample read. Progress counts
+/// the fill, so the counter never freezes mid-scan.
+#[test]
+fn scan_samples_tell_distinct_same_size_files_apart() {
+    use crate::import::{ScanInput, ScanProgress, scan_with};
+    let src = temp_dir("scansample");
+    let mut a = vec![0xA5u8; 70_000];
+    a.extend(vec![0x11u8; 200_000]);
+    std::fs::write(src.join("a.png"), &a).unwrap();
+    std::fs::write(src.join("b.png"), &a).unwrap(); // same bytes
+    let mut c = vec![0x5Au8; 70_000]; // same size, another head
+    c.extend(vec![0x11u8; 200_000]);
+    std::fs::write(src.join("c.png"), &c).unwrap();
+    std::fs::write(src.join("d.png"), b"small-one").unwrap();
+    std::fs::write(src.join("e.png"), b"small-two").unwrap(); // same small size, other bytes
+    let mut s = Session::new().with_fs();
+    s.media.scan_probe = Some(size_probe());
+    let (input, paths) = ScanInput::new(&mut s, &[src.to_string_lossy().to_string()]);
+    let progress = ScanProgress::default();
+    let out = scan_with(input, &paths, &progress);
+    assert_eq!(out.candidates.len(), 5);
+    let dup_of = |name: &str| out.candidates.iter().find(|c| c.name == name).unwrap_or_else(|| panic!("{name} missing")).duplicate.clone();
+    let twins = [dup_of("a.png"), dup_of("b.png")];
+    assert_eq!(twins.iter().filter(|d| d.as_deref() == Some("content")).count(), 1, "exactly one twin is the duplicate");
+    assert!(twins.contains(&None), "the other twin stands");
+    for name in ["c.png", "d.png", "e.png"] {
+        assert_eq!(dup_of(name), None, "{name} is new");
+    }
+    let hash_of = |name: &str| {
+        out.probes
+            .iter()
+            .find(|(p, _)| Path::new(p.as_str()).file_name().is_some_and(|n| n == name))
+            .unwrap_or_else(|| panic!("{name} has no kept probe"))
+            .1
+            .content_hash
+            .clone()
+    };
+    let (ha, hb, hc, hd, he) = (hash_of("a.png"), hash_of("b.png"), hash_of("c.png"), hash_of("d.png"), hash_of("e.png"));
+    assert!(ha.as_ref().is_some_and(|h| h.len() == 32));
+    assert_eq!(hb, ha, "twins share a hash");
+    assert_eq!(hc, None, "another head rules it out: never read whole");
+    assert_eq!(hd.as_deref(), Some(lightcraft_preview::hash_bytes(b"small-one").to_string()).as_deref());
+    assert_eq!(he.as_deref(), Some(lightcraft_preview::hash_bytes(b"small-two").to_string()).as_deref());
+    assert_ne!(hd, he);
+    use std::sync::atomic::Ordering::Relaxed;
+    assert_eq!(progress.done.load(Relaxed), progress.total.load(Relaxed), "the fill counts its reads");
+    assert!(progress.total.load(Relaxed) >= 5);
+    let _ = std::fs::remove_dir_all(&src);
+}
+
+/// A candidate matches a library photo by content only when its head sample does: an identical
+/// file elsewhere is a duplicate, a same-size file with another head is new and stays
+/// unhashed. When the library's own file is gone its size cannot be sampled, so the candidate
+/// hashes whole to check against the stored hash.
+#[test]
+fn scan_fill_matches_library_by_content() {
+    let src = temp_dir("libmatch-src");
+    let mut a = vec![0xA5u8; 70_000];
+    a.extend(vec![0x11u8; 200_000]);
+    std::fs::write(src.join("a.png"), &a).unwrap();
+    let mut c = vec![0x5Au8; 70_000];
+    c.extend(vec![0x11u8; 200_000]);
+    let mut s = Session::new().with_fs();
+    s.media.scan_probe = Some(size_probe());
+    let r = s.execute("library.import", &json!({"paths": [src.to_string_lossy()]})).unwrap();
+    assert_eq!(ids(&r, "imported"), 1, "{r}");
+    let id = s.catalog.photos().next().unwrap().id.0;
+    assert!(s.catalog.photos().next().unwrap().content_hash.as_ref().is_some_and(|h| h.len() == 32));
+    let other = temp_dir("libmatch-other");
+    std::fs::write(other.join("twin.png"), &a).unwrap();
+    std::fs::write(other.join("c.png"), &c).unwrap();
+    let preview = s.execute("library.importPreview", &json!({"paths": [other.to_string_lossy()]})).unwrap();
+    let dup_of = |r: &Value, name: &str| {
+        r["candidates"].as_array().unwrap().iter().find(|c| c["name"] == name).unwrap_or_else(|| panic!("{name} missing: {r}")).clone()
+    };
+    let twin = dup_of(&preview, "twin.png");
+    assert_eq!(twin["duplicate"], "content", "{preview}");
+    assert_eq!(twin["existing"].as_u64(), Some(id), "{preview}");
+    assert_eq!(dup_of(&preview, "c.png")["duplicate"], Value::Null, "{preview}");
+    let hash_of = |probes: &std::collections::HashMap<String, crate::media::ProbeInfo>, name: &str| {
+        probes
+            .iter()
+            .find(|(p, _)| Path::new(p.as_str()).file_name().is_some_and(|n| n == name))
+            .unwrap_or_else(|| panic!("{name} has no kept probe"))
+            .1
+            .content_hash
+            .clone()
+    };
+    assert!(hash_of(&s.import_probes, "twin.png").as_ref().is_some_and(|h| h.len() == 32));
+    assert_eq!(hash_of(&s.import_probes, "c.png"), None, "another head than the library file: unhashed");
+    // the library's own file is gone: its size is unsampled, so the candidate hashes whole —
+    // still no duplicate, now with a hash to prove the check ran
+    std::fs::remove_file(src.join("a.png")).unwrap();
+    let preview = s.execute("library.importPreview", &json!({"paths": [other.to_string_lossy()]})).unwrap();
+    assert_eq!(dup_of(&preview, "twin.png")["duplicate"], "content", "{preview}");
+    assert_eq!(dup_of(&preview, "c.png")["duplicate"], Value::Null, "{preview}");
+    assert!(hash_of(&s.import_probes, "c.png").as_ref().is_some_and(|h| h.len() == 32), "unsampled size hashes whole");
+    let _ = std::fs::remove_dir_all(&src);
+    let _ = std::fs::remove_dir_all(&other);
+}
+
 #[test]
 fn copy_into_library_and_persist() {
     let src = temp_dir("copysrc");
