@@ -1197,7 +1197,7 @@ pub fn show(app: &mut LightcraftApp, ctx: &egui::Context) {
                 let add_label;
                 let ok = match &dlg {
                     Dialog::Import { opts } => {
-                        let n = opts.selected_paths().len();
+                        let n = opts.checked_paths().len();
                         let verb = if opts.copy && opts.move_files { "Move" } else { "Import" };
                         add_label = crate::i18n::tr_format!("{verb} {n} Photo{}", if n == 1 { "" } else { "s" }, verb = crate::i18n::tr(verb), n = n);
                         add_label.as_str()
@@ -1225,12 +1225,13 @@ pub fn show(app: &mut LightcraftApp, ctx: &egui::Context) {
                     _ => "OK",
                 };
                 // installing waits for the licence to be accepted
-                // (and Synchronize waits for the scan)
+                // (and Synchronize waits for the scan, as does the import review)
                 let can_confirm = informational
                     || !matches!(
                         &dlg,
                         Dialog::DenoiseModel { accepted: false, .. } | Dialog::FaceModel { accepted: false, .. } | Dialog::SynchronizeFolder { counts: None, .. }
                     )
+                        && !(matches!(&dlg, Dialog::Import { .. }) && crate::import::scan_running(app))
                         // smart-album rules that can't mean anything wait to be fixed
                         && !matches!(&dlg, Dialog::SmartRules { id, rules, .. } if !rules.check_for(&app.session.catalog, id.map(lightcraft_catalog::AlbumId)).is_empty());
                 let r = (!ok.is_empty()).then(|| ui.add_enabled(can_confirm, egui::Button::new(crate::i18n::tr(ok))));

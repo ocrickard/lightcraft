@@ -2838,7 +2838,10 @@ mod tests {
         assert_eq!(r["result"]["scanning"], true, "{r}");
         let r = h.request("engine.execute", json!({"command": "file.addFromDevice", "params": {"path": dir.to_string_lossy()}}), t);
         assert_ne!(r["ok"], true, "a second scan is refused: {r}");
-        assert!(!h.app.scan.as_ref().unwrap().copy, "the running scan keeps its options");
+        assert!(
+            matches!(&h.app.ui.dialog, Some(crate::state::Dialog::Import { opts }) if !opts.copy),
+            "the review opens at once and the running scan keeps its options"
+        );
         let r = h.request("ui.inspect", json!({}), t);
         assert!(r["result"]["scan"].is_object(), "{r}");
         // Cancel is the ✕ of the scan's row in the activity stack (shown once it is half a second old)
@@ -2851,7 +2854,66 @@ mod tests {
         assert!(h.app.scan.is_none(), "✕ closes the scan at once");
         gate.store(true, std::sync::atomic::Ordering::Relaxed);
         h.settle(SETTLE);
-        assert!(h.app.ui.dialog.is_none(), "a cancelled scan opens no review");
+        assert!(h.app.ui.dialog.is_none(), "a cancelled scan keeps no review");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The review opens while the scan is still running: photos join the grid as they are
+    /// probed, choosing mid-scan survives the finished scan, and confirming waits for it.
+    #[test]
+    fn import_review_fills_in_while_scanning() {
+        let mut h = demo([1200.0, 900.0]);
+        let t = Duration::from_secs(10);
+        let dir = std::env::temp_dir().join(format!("lc-scanstream-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for i in 0..3u8 {
+            std::fs::write(dir.join(format!("img{i}.png")), vec![i; 100 + usize::from(i)]).unwrap();
+        }
+        // probes pass one at a time, when the test releases them
+        let next = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let released = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (n, r) = (next.clone(), released.clone());
+        h.app.session.media.file_probe = Some(std::sync::Arc::new(move |p: &str| {
+            let ticket = n.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            while r.load(std::sync::atomic::Ordering::SeqCst) <= ticket {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Ok(lightcraft_engine::media::ProbeInfo {
+                file_size: std::fs::metadata(p).map(|m| m.len()).unwrap_or(0),
+                format: "PNG".into(),
+                width: 40,
+                height: 30,
+                ..Default::default()
+            })
+        }));
+        let r = h.request("engine.execute", json!({"command": "file.addFolder", "params": {"path": dir.to_string_lossy()}}), t);
+        assert_eq!(r["result"]["scanning"], true, "{r}");
+        // the review is open with nothing yet: no probe passed the gate
+        let Some(crate::state::Dialog::Import { opts }) = &h.app.ui.dialog else { panic!("no import review") };
+        assert!(opts.candidates.is_empty());
+        assert!(h.app.scan.is_some());
+        // confirming waits for the scan (duplicates are unknown until it finishes)
+        let r = h.request("ui.dialog.confirm", json!({}), t);
+        assert_ne!(r["ok"], true, "nothing to import yet: {r}");
+        assert!(matches!(h.app.ui.dialog, Some(crate::state::Dialog::Import { .. })), "the review stays open");
+        // one photo arrives; unchecking it mid-scan survives the finished scan
+        released.store(1, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            h.step_until(t, |h| matches!(&h.app.ui.dialog, Some(crate::state::Dialog::Import { opts }) if opts.candidates.len() == 1)),
+            "one photo joins"
+        );
+        let first = match &h.app.ui.dialog {
+            Some(crate::state::Dialog::Import { opts }) => opts.candidates[0].path.clone(),
+            _ => panic!("no import review"),
+        };
+        let r = h.request("ui.clickWidget", json!({"id": "import:0:check"}), t);
+        assert_eq!(r["ok"], true, "{r}");
+        released.store(usize::MAX, std::sync::atomic::Ordering::SeqCst);
+        h.step_until(SETTLE, |h| h.app.scan.is_none());
+        let Some(crate::state::Dialog::Import { opts }) = &h.app.ui.dialog else { panic!("no import review") };
+        assert_eq!(opts.candidates.len(), 3);
+        assert_eq!(opts.checked_paths().len(), 2, "the mid-scan uncheck survived");
+        assert!(!opts.checked[opts.candidates.iter().position(|c| c.path == first).unwrap()]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2978,16 +3040,38 @@ mod tests {
         assert_eq!(r["result"]["scanning"], true, "{r}");
         h.settle(SETTLE);
         h.step_until(SETTLE, |h| matches!(h.app.ui.dialog, Some(crate::state::Dialog::Import { .. })));
+        // the review opens before the scan finishes: wait for the final candidates
+        h.step_until(SETTLE, |h| h.app.scan.is_none());
         h.step_until(SETTLE, |h| h.app.renderer.textures.keys().filter(|s| matches!(s, crate::render::Slot::Import(_))).count() >= 5);
         let Some(crate::state::Dialog::Import { opts }) = &h.app.ui.dialog else { panic!("no import review") };
         assert_eq!(opts.candidates.len(), 6);
         assert_eq!(opts.candidates.iter().filter(|c| c.duplicate.is_some()).count(), 1);
         assert!(h.app.renderer.textures.keys().filter(|s| matches!(s, crate::render::Slot::Import(_))).count() >= 5, "thumbnails");
-        // uncheck the first photo; name a new album and keywords
+        // click the first photo: it selects (checking nothing); Shift-click the third: the
+        // range selects; back on the first photo, then its checkbox unchecks just it
         let r = h.request("ui.clickWidget", json!({"id": "import:0"}), t);
         assert_eq!(r["ok"], true, "{r}");
+        if let Some(crate::state::Dialog::Import { opts }) = &h.app.ui.dialog {
+            assert_eq!(opts.selected, [true, false, false, false, false, false], "click selects one");
+            assert_eq!(opts.checked_paths().len(), 5, "selecting checks nothing");
+        } else {
+            panic!("no import dialog");
+        }
+        let r = h.request("ui.clickWidget", json!({"id": "import:2", "shift": true}), t);
+        assert_eq!(r["ok"], true, "{r}");
+        if let Some(crate::state::Dialog::Import { opts }) = &h.app.ui.dialog {
+            assert_eq!(opts.selected, [true, true, true, false, false, false], "Shift-click selects the range");
+            assert_eq!(opts.checked_paths().len(), 5, "selecting checks nothing");
+        } else {
+            panic!("no import dialog");
+        }
+        let r = h.request("ui.clickWidget", json!({"id": "import:0"}), t);
+        assert_eq!(r["ok"], true, "{r}");
+        let r = h.request("ui.clickWidget", json!({"id": "import:0:check"}), t);
+        assert_eq!(r["ok"], true, "{r}");
         if let Some(crate::state::Dialog::Import { opts }) = &mut h.app.ui.dialog {
-            assert_eq!(opts.selected_paths().len(), 4, "duplicate and unchecked photo left out");
+            assert_eq!(opts.checked_paths().len(), 4, "duplicate and unchecked photo left out");
+            assert_eq!(opts.selected, [true, false, false, false, false, false], "checking keeps the selection");
             opts.new_album = "Card 1".into();
             opts.keywords = "cardone, 2026".into();
         } else {
@@ -3036,22 +3120,24 @@ mod tests {
             h.request("engine.execute", json!({"command": "photo.delete", "params": {"ids": [id]}}), t);
             h.request("engine.execute", json!({"command": "file.addPhotos", "params": {"paths": [dir.to_string_lossy()]}}), t);
             h.step_until(SETTLE, |h| matches!(h.app.ui.dialog, Some(crate::state::Dialog::Import { .. })));
+            // the review opens before the scan finishes: wait for the final candidates
+            h.step_until(SETTLE, |h| h.app.scan.is_none());
             let Some(crate::state::Dialog::Import { opts }) = &mut h.app.ui.dialog else { panic!("no import review") };
             assert_eq!(opts.on_deleted, "restore", "the default brings a deleted photo back");
-            assert_eq!(opts.selected_paths().len(), 2, "the trashed file is checked from the start: it will be restored");
+            assert_eq!(opts.checked_paths().len(), 2, "the trashed file is checked from the start: it will be restored");
             opts.set_on_deleted("");
-            assert_eq!(opts.selected_paths().len(), 1, "Leave them: only the new file");
+            assert_eq!(opts.checked_paths().len(), 1, "Leave them: only the new file");
             opts.set_on_deleted(choice);
-            assert_eq!(opts.selected_paths().len(), 2, "the trashed file is checked again once a choice is made");
+            assert_eq!(opts.checked_paths().len(), 2, "the trashed file is checked again once a choice is made");
             // a per-cell choice survives switching between the two options, and "Leave them" unchecks
             let trashed = (0..opts.candidates.len()).find(|i| opts.is_trashed(*i)).unwrap();
             opts.checked[trashed] = false;
             opts.set_on_deleted(if choice == "restore" { "fresh" } else { "restore" });
-            assert_eq!(opts.selected_paths().len(), 1, "still unchecked");
+            assert_eq!(opts.checked_paths().len(), 1, "still unchecked");
             opts.set_on_deleted("");
-            assert_eq!(opts.selected_paths().len(), 1);
+            assert_eq!(opts.checked_paths().len(), 1);
             opts.set_on_deleted(choice);
-            assert_eq!(opts.selected_paths().len(), 2);
+            assert_eq!(opts.checked_paths().len(), 2);
             let r = h.request("ui.dialog.confirm", json!({}), t);
             assert_eq!(r["ok"], true, "{r}");
             // frames until the import has finished, so its (timed) toast is read before it expires
@@ -3245,6 +3331,8 @@ mod tests {
         assert_eq!(r["result"]["scanning"], true, "{r}");
         h.settle(SETTLE);
         h.step_until(SETTLE, |h| matches!(h.app.ui.dialog, Some(crate::state::Dialog::Import { .. })));
+        // the review opens before the scan finishes: wait for the final candidates
+        h.step_until(SETTLE, |h| h.app.scan.is_none());
         let Some(crate::state::Dialog::Import { opts }) = &h.app.ui.dialog else { panic!("no import review") };
         assert_eq!(opts.candidates.len(), 20);
         for id in ["button:importCopy", "button:importDest"] {

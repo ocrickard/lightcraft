@@ -284,7 +284,7 @@ fn import_cancelled_by_command_reports_cancelled() {
 #[test]
 fn scan_shows_a_row_and_cancel_closes_it() {
     let (mut h, dir) = slow_import("scan", 120);
-    crate::import::open(&mut h.app, vec![dir.to_string_lossy().to_string()]).unwrap();
+    crate::import::open(&mut h.app, vec![dir.to_string_lossy().to_string()], false).unwrap();
     h.step();
     let tasks = h.app.session.activity.list();
     assert_eq!(tasks.first().map(|t| t.kind), Some("scan"), "{tasks:?}");

@@ -155,7 +155,7 @@
   "{n} change{} couldn't be written to disk: {e}\nIf you quit now, {} lost.": "Cambios que no se pudieron escribir en el disco: {n}{0:.0}: {e}\nSi se sale ahora, se perderán.{1:.0}",
   "{n} change{} saved in memory but not written to disk: {e}\nLightCraft retries automatically; quitting now would lose {}.": "Cambios guardados en memoria, pero no escritos en el disco: {n}{0:.0}: {e}\nLightCraft vuelve a intentarlo automáticamente; si se sale ahora, se perderán.{1:.0}",
   "{n} change{} saved in memory but not written to disk: {e} — LightCraft will retry": "Cambios guardados solo en memoria: {n}{:.0}: {e}; LightCraft volverá a intentarlo",
-  "{n} found · {sel} selected": "{n} encontradas · {sel} seleccionadas",
+  "{n} found · {checked} checked": "{n} encontradas · {checked} marcadas",
   "{n} photos": "{n} fotos",
   "{n} photos in {} are hidden by the filters above": "Los filtros de arriba ocultan {n} fotos en {}",
   "{n} photo{}": "{n} foto{}",

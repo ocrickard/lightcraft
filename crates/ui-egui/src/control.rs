@@ -5,7 +5,7 @@
 //! - `engine.commands`: engine + UI commands with enablement
 //! - `ui.inspect`: UI state, panels, view, canvas/image rects, perf
 //! - `ui.widgets {filter?}`: every registered widget id → rect (sliders, buttons, thumbnails…)
-//! - `ui.clickWidget {id, count?}`: click a widget by automation id (real egui input)
+//! - `ui.clickWidget {id, count?, shift?, alt?, ctrl?, cmd?}`: click a widget by automation id (real egui input)
 //! - `ui.dragWidget {id, toX?, toY?, dx?, dy?}`: drag from a widget's centre
 //! - `ui.move/click/drag {x, y, …}`: raw pointer input in screen points
 //! - `ui.pointer {events: [{kind: down|drag|up, x, y}], space: "image"}`: gestures in normalized
@@ -205,6 +205,9 @@ pub fn handle(app: &mut LightcraftApp, ctx: &egui::Context, req: &ControlRequest
                 let n = p.get("count").and_then(Value::as_u64).unwrap_or(1);
                 let button = if s("button") == Some("right") { egui::PointerButton::Secondary } else { egui::PointerButton::Primary };
                 app.synthetic.push(egui::Event::PointerMoved(at));
+                // the press carries the modifiers, but so must the input state: readers of
+                // `input.modifiers` (Shift-click) never see the event's own
+                app.synthetic.push(egui::Event::ModifiersChanged(m));
                 for _ in 0..n {
                     app.synthetic.push(egui::Event::PointerButton { pos: at, button, pressed: true, modifiers: m });
                     app.synthetic.push(egui::Event::PointerButton { pos: at, button, pressed: false, modifiers: m });
@@ -233,6 +236,8 @@ pub fn handle(app: &mut LightcraftApp, ctx: &egui::Context, req: &ControlRequest
                 push_drag(app, a, b, p.get("steps").and_then(Value::as_u64).unwrap_or(10), m);
             } else {
                 app.synthetic.push(egui::Event::PointerMoved(a));
+                // as above: the requested modifiers reach `input.modifiers` too
+                app.synthetic.push(egui::Event::ModifiersChanged(m));
                 for _ in 0..p.get("count").and_then(Value::as_u64).unwrap_or(1) {
                     app.synthetic.push(egui::Event::PointerButton { pos: a, button, pressed: true, modifiers: m });
                     app.synthetic.push(egui::Event::PointerButton { pos: a, button, pressed: false, modifiers: m });

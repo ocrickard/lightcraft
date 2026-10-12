@@ -1,7 +1,8 @@
 //! The import review dialog (File → Import Photos… / Import from Folder… / Import from Device):
 //! the source it scanned (a scanned folder is *not* added to Local), the files found under it as
-//! a grid of thumbnails with checkboxes (duplicates marked and unchecked; Shift-click sets a
-//! range), the destination (add in place / copy or move into the library's `Originals/` or a
+//! a grid of thumbnails with checkboxes (duplicates marked and unchecked; click selects,
+//! Shift-click selects a range, the checkbox chooses what imports), the destination (add in
+//! place / copy or move into the library's `Originals/` or a
 //! chosen folder, filed by day, by month, into one folder or by a custom folder template,
 //! optionally renamed), an album (existing or new), a preset and keywords to apply. Importing
 //! runs on a worker thread (files are probed, copied or moved there) and its batches join the
@@ -10,7 +11,7 @@
 
 use egui::{Align2, Color32, Rect, Sense, Stroke, StrokeKind, pos2, vec2};
 use lightcraft_engine::import::{
-    ImportCandidate, ImportUprightMode, ImportWarning, ImportWarningCode, ScanInput, ScanOutput, ScanProgress, scan_with,
+    ImportCandidate, ImportUprightMode, ImportWarning, ImportWarningCode, ScanEvent, ScanInput, ScanOutput, ScanProgress, scan_with,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -58,6 +59,9 @@ pub struct ImportDialog {
     pub sources: Vec<String>,
     pub candidates: Vec<ImportCandidate>,
     pub checked: Vec<bool>,
+    /// Highlighted cells (click, Shift-click for a range): what a checkbox click applies to —
+    /// not what imports (that is [`ImportDialog::checked`]).
+    pub selected: Vec<bool>,
     /// Copy into the library (else add in place).
     pub copy: bool,
     /// With `copy`: move instead — the originals are removed from the source once each copy is
@@ -88,7 +92,8 @@ pub struct ImportDialog {
     /// What to do with those: `restore` (the default: the photo comes back with its edits), `fresh`
     /// (imported as a new photo, the old record deleted) or "" (leave them) — the `onDeleted` param.
     pub on_deleted: String,
-    /// The candidate clicked last: where a Shift-click range starts ([`ImportDialog::click`]).
+    /// The selection anchor: the candidate clicked last, where a Shift-click range starts
+    /// ([`ImportDialog::click`]).
     #[serde(skip)]
     pub last_clicked: Option<usize>,
 }
@@ -112,7 +117,8 @@ fn file_type(c: &ImportCandidate) -> String {
 impl ImportDialog {
     pub fn new(candidates: Vec<ImportCandidate>) -> Self {
         let checked = candidates.iter().map(|c| c.duplicate.is_none() && c.error.is_none()).collect();
-        ImportDialog { candidates, checked, on_deleted: "restore".into(), ..Default::default() }
+        let selected = vec![false; candidates.len()];
+        ImportDialog { candidates, checked, selected, on_deleted: "restore".into(), ..Default::default() }
     }
     /// Mark the candidates whose photo is in Recently Deleted. They are checked when the choice
     /// for them (`on_deleted`) imports them — by default it restores them, so a photo deleted by
@@ -173,25 +179,49 @@ impl ImportDialog {
             }
         }
     }
-    /// A click on candidate `i` toggles its checkbox. With `shift`, every importable candidate
-    /// from the last clicked one to `i` takes `i`'s new state, as in a file manager: click the
-    /// first, Shift-click the last, and the whole range is checked (or unchecked).
+    /// A click on candidate `i` selects it (the only one), as in a file manager. With
+    /// `shift`, the range from the last clicked candidate to `i` is selected instead; the
+    /// anchor stays, so another Shift-click re-ranges from it. Selection is the highlight —
+    /// what imports is [`ImportDialog::checked`], toggled on the checkbox.
     pub fn click(&mut self, i: usize, shift: bool) {
+        if i >= self.candidates.len() {
+            return;
+        }
+        let anchor = self.last_clicked.filter(|a| *a < self.candidates.len());
+        let from = if shift { anchor.unwrap_or(i) } else { i };
+        self.selected.fill(false);
+        for k in from.min(i)..=from.max(i) {
+            if let Some(s) = self.selected.get_mut(k) {
+                *s = true;
+            }
+        }
+        if !shift || anchor.is_none() {
+            self.last_clicked = Some(i);
+        }
+    }
+    /// A click on candidate `i`'s checkbox toggles whether it imports. When `i` is one of
+    /// several selected, the whole selection takes `i`'s new state (the importable ones — the
+    /// rest stay unchecked), so a Shift-selected range is checked with one click.
+    pub fn toggle_check(&mut self, i: usize) {
         if !self.importable(i) {
             return;
         }
         let Some(on) = self.checked.get(i).map(|c| !c) else { return };
-        let from = if shift { self.last_clicked.filter(|a| *a < self.checked.len()).unwrap_or(i) } else { i };
-        for k in from.min(i)..=from.max(i) {
-            if self.importable(k)
-                && let Some(c) = self.checked.get_mut(k)
-            {
-                *c = on;
+        let in_multi = self.selected.get(i).copied().unwrap_or(false) && self.selected.iter().filter(|s| **s).count() > 1;
+        if in_multi {
+            for k in 0..self.candidates.len() {
+                if self.selected.get(k).copied().unwrap_or(false)
+                    && self.importable(k)
+                    && let Some(c) = self.checked.get_mut(k)
+                {
+                    *c = on;
+                }
             }
+        } else if let Some(c) = self.checked.get_mut(i) {
+            *c = on;
         }
-        self.last_clicked = Some(i);
     }
-    pub fn selected_paths(&self) -> Vec<String> {
+    pub fn checked_paths(&self) -> Vec<String> {
         self.candidates
             .iter()
             .zip(&self.checked)
@@ -407,13 +437,9 @@ impl ImportRun {
 /// window must keep answering meanwhile).
 pub struct ScanTask {
     progress: std::sync::Arc<ScanProgress>,
-    rx: std::sync::mpsc::Receiver<ScanOutput>,
-    /// Open the review with "copy into the library" checked (a camera / card).
-    pub copy: bool,
+    rx: std::sync::mpsc::Receiver<ScanEvent>,
     /// Browsing a folder (Local): the photos are read in place instead of opening the review.
     browse: bool,
-    /// What is being scanned (the review's source).
-    sources: Vec<String>,
     /// The scan's row in the activity stack (its ✕ and `activity.cancel` set `progress.cancel`).
     guard: lightcraft_engine::activity::TaskGuard,
 }
@@ -430,26 +456,39 @@ pub(crate) fn busy_synchronizing(app: &LightcraftApp) -> Result<(), String> {
     if app.sync_run.is_some() { Err(crate::i18n::tr("A folder is being synchronized").to_string()) } else { Ok(()) }
 }
 
-/// Scan `paths` in the background, then open the review dialog (see [`poll_scan`]).
-pub fn open(app: &mut LightcraftApp, paths: Vec<String>) -> Result<Value, String> {
+/// Open the review dialog for `paths` at once and scan in the background: photos join the
+/// grid as they are probed, and the finished scan replaces them wholesale with duplicate marks
+/// (see [`poll_scan`]).
+pub fn open(app: &mut LightcraftApp, paths: Vec<String>, copy: bool) -> Result<Value, String> {
     if app.scan.is_some() {
         return Err("a scan is already running".into());
     }
     let sources = paths.clone();
     let (input, paths) = ScanInput::new(&mut app.session, &paths);
-    let progress = std::sync::Arc::new(ScanProgress::default());
     let (tx, rx) = std::sync::mpsc::channel();
+    let progress = std::sync::Arc::new(ScanProgress { updates: Some(tx.clone()), ..Default::default() });
     let p = progress.clone();
     let job = move || {
-        let _ = tx.send(scan_with(input, &paths, &p));
+        let out = scan_with(input, &paths, &p);
+        let _ = tx.send(ScanEvent::Done(out));
     };
     #[cfg(not(target_arch = "wasm32"))]
     std::thread::spawn(job);
     #[cfg(target_arch = "wasm32")]
     job();
     let guard = scan_guard(app, &progress, false);
-    app.scan = Some(ScanTask { progress, rx, copy: false, browse: false, sources, guard });
+    app.scan = Some(ScanTask { progress, rx, browse: false, guard });
+    let mut d = ImportDialog::new(Vec::new());
+    d.sources = sources;
+    d.copy = copy;
+    app.renderer.forget_imports();
+    app.ui.dialog = Some(crate::state::Dialog::Import { opts: Box::new(d) });
     Ok(json!({"scanning": true}))
+}
+
+/// The import review is still scanning: its grid fills in, and its controls wait for the scan.
+pub fn scan_running(app: &LightcraftApp) -> bool {
+    app.scan.as_ref().is_some_and(|t| !t.browse)
 }
 
 /// Show a folder's photos in the Local view (`library.browse` from the UI): the view switches at
@@ -503,44 +542,105 @@ pub fn browse(app: &mut LightcraftApp, path: &str, subfolders: Option<bool>) -> 
             v.sort();
             v
         };
-        let _ = tx.send(scan_with(input, &files, &p));
+        let out = scan_with(input, &files, &p);
+        let _ = tx.send(ScanEvent::Done(out));
     };
     #[cfg(not(target_arch = "wasm32"))]
     std::thread::spawn(job);
     #[cfg(target_arch = "wasm32")]
     job();
     let guard = scan_guard(app, &progress, true);
-    app.scan = Some(ScanTask { progress, rx, copy: false, browse: true, sources: Vec::new(), guard });
+    app.scan = Some(ScanTask { progress, rx, browse: true, guard });
     app.renderer.forget_imports();
     Ok(json!({"path": dir_s, "subfolders": subfolders, "scanning": true}))
 }
 
-/// Collect a finished scan and open the review (called every frame).
+/// Feed a running scan into the review (called every frame): photos join the grid as they
+/// are probed, and the finished scan replaces them wholesale with duplicate marks.
 pub fn poll_scan(app: &mut LightcraftApp, ctx: &egui::Context) {
     let Some(task) = app.scan.as_ref() else { return };
     ctx.request_repaint_after(std::time::Duration::from_millis(100));
-    let out = match task.rx.try_recv() {
-        Ok(o) => o,
-        Err(std::sync::mpsc::TryRecvError::Empty) => {
-            if task.guard.is_cancelled() {
-                // ✕: the worker stops at its next file; don't wait for it (a NAS read can take a while)
-                app.scan = None;
+    if task.guard.is_cancelled() {
+        // ✕: the worker stops at its next file; don't wait for it (a NAS read can take a while).
+        // The review opened for the scan closes with it (a browse scan has no dialog to close).
+        let browse = task.browse;
+        if !browse {
+            app.ui.dialog = None;
+        }
+        app.scan = None;
+        return;
+    }
+    if !task.browse && !matches!(app.ui.dialog, Some(crate::state::Dialog::Import { .. })) {
+        // its dialog closed first (Cancel, Esc): stop the worker instead of reopening at Done
+        task.progress.cancel.store(true, Ordering::Relaxed);
+        app.scan = None;
+        return;
+    }
+    loop {
+        let (browse, ev) = match app.scan.as_ref() {
+            Some(task) => (task.browse, task.rx.try_recv()),
+            None => return,
+        };
+        match ev {
+            Ok(ScanEvent::Seed(found)) => {
+                if !browse {
+                    push_candidates(app, found);
+                }
+            }
+            Ok(ScanEvent::Probed { path, result }) => {
+                if !browse {
+                    push_candidates(app, vec![ImportCandidate::provisional(path, &result)]);
+                }
+            }
+            Ok(ScanEvent::Done(out)) => {
+                finish_scan(app, ctx, out);
                 return;
             }
-            let (total, done) = (task.progress.total.load(Ordering::Relaxed), task.progress.done.load(Ordering::Relaxed));
-            task.guard.progress(done as u64, total as u64);
-            // while the folders are listed the total isn't known: say what is happening instead
-            task.guard.detail(if total == 0 { crate::i18n::tr("Looking for photos…") } else { "" });
-            return;
+            Err(std::sync::mpsc::TryRecvError::Empty) => break,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                app.scan = None;
+                if !browse {
+                    app.ui.dialog = None;
+                }
+                app.toast(ctx, crate::i18n::tr("Scan failed"));
+                return;
+            }
         }
-        Err(_) => {
-            app.scan = None;
-            app.toast(ctx, crate::i18n::tr("Scan failed"));
-            return;
-        }
-    };
+    }
+    let Some(task) = app.scan.as_ref() else { return };
+    let (total, done) = (task.progress.total.load(Ordering::Relaxed), task.progress.done.load(Ordering::Relaxed));
+    task.guard.progress(done as u64, total as u64);
+    // while the folders are listed the total isn't known: say what is happening instead
+    task.guard.detail(if total == 0 { crate::i18n::tr("Looking for photos…") } else { "" });
+}
+
+/// A candidate whose photo is in Recently Deleted (restored by default: checked like the
+/// importable files).
+fn is_trashed_candidate(app: &LightcraftApp, c: &ImportCandidate) -> bool {
+    c.duplicate.is_some() && c.existing.is_some_and(|id| app.session.catalog.photo(lightcraft_catalog::PhotoId(id)).is_some_and(|p| p.deleted))
+}
+
+/// Append streamed candidates to the open review, in arrival order with default checks — the
+/// same defaults the finished scan computes, so mid-scan choices merge cleanly at Done.
+fn push_candidates(app: &mut LightcraftApp, found: Vec<ImportCandidate>) {
+    let flags: Vec<bool> = found.iter().map(|c| is_trashed_candidate(app, c)).collect();
+    let Some(crate::state::Dialog::Import { opts }) = &mut app.ui.dialog else { return };
+    for (c, trashed) in found.into_iter().zip(flags) {
+        opts.checked.push((c.duplicate.is_none() || trashed) && c.error.is_none());
+        opts.selected.push(false);
+        opts.trashed.push(trashed);
+        opts.candidates.push(c);
+    }
+}
+
+/// Collect a finished scan: the Local view's photos join it, the review is replaced wholesale
+/// with duplicate marks (a cancelled scan leaves nothing behind).
+fn finish_scan(app: &mut LightcraftApp, ctx: &egui::Context, out: ScanOutput) {
     let Some(task) = app.scan.take() else { return };
     if task.progress.cancel.load(Ordering::Relaxed) {
+        if !task.browse {
+            app.ui.dialog = None;
+        }
         return;
     }
     app.session.import_probes = out.probes;
@@ -557,23 +657,54 @@ pub fn poll_scan(app: &mut LightcraftApp, ctx: &egui::Context) {
         return;
     }
     if out.candidates.is_empty() {
+        app.ui.dialog = None;
         app.toast(ctx, crate::i18n::tr("No photos found"));
         return;
     }
     app.renderer.forget_imports();
     let mut d = ImportDialog::new(out.candidates);
-    let trashed = d
-        .candidates
-        .iter()
-        .map(|c| {
-            c.duplicate.is_some()
-                && c.existing.is_some_and(|id| app.session.catalog.photo(lightcraft_catalog::PhotoId(id)).is_some_and(|p| p.deleted))
-        })
-        .collect();
+    let trashed = d.candidates.iter().map(|c| is_trashed_candidate(app, c)).collect();
     d.set_trashed(trashed);
-    d.copy = task.copy;
-    d.sources = task.sources;
+    // the review was live during the scan: keep what the user chose there
+    if let Some(crate::state::Dialog::Import { opts: old }) = &app.ui.dialog {
+        carry_over(&mut d, old);
+    }
     app.ui.dialog = Some(crate::state::Dialog::Import { opts: Box::new(d) });
+}
+
+/// Keep the live review's choices across the finished scan's replacement: options verbatim;
+/// checks and the selection by path (a photo unchecked mid-scan stays unchecked; duplicates
+/// still arrive unchecked); the selection anchor follows its photo.
+fn carry_over(d: &mut ImportDialog, old: &ImportDialog) {
+    d.copy = old.copy;
+    d.move_files = old.move_files;
+    d.album = old.album;
+    d.new_album.clone_from(&old.new_album);
+    d.preset.clone_from(&old.preset);
+    d.keywords.clone_from(&old.keywords);
+    d.destination.clone_from(&old.destination);
+    d.organize.clone_from(&old.organize);
+    d.folder_template.clone_from(&old.folder_template);
+    d.rename.clone_from(&old.rename);
+    d.metadata_preset.clone_from(&old.metadata_preset);
+    d.dng = old.dng;
+    d.on_deleted.clone_from(&old.on_deleted);
+    d.sources.clone_from(&old.sources);
+    let mut old_state: std::collections::HashMap<&str, (bool, bool)> = std::collections::HashMap::with_capacity(old.candidates.len());
+    for (i, c) in old.candidates.iter().enumerate() {
+        old_state.insert(c.path.as_str(), (old.checked.get(i).copied().unwrap_or(true), old.selected.get(i).copied().unwrap_or(false)));
+    }
+    for (i, c) in d.candidates.iter().enumerate() {
+        if let Some((checked, selected)) = old_state.get(c.path.as_str()) {
+            if let Some(slot) = d.checked.get_mut(i) {
+                *slot &= checked;
+            }
+            if let Some(slot) = d.selected.get_mut(i) {
+                *slot |= selected;
+            }
+        }
+    }
+    d.last_clicked = old.last_clicked.and_then(|j| old.candidates.get(j)).and_then(|o| d.candidates.iter().position(|c| c.path == o.path));
 }
 
 impl ScanTask {
@@ -586,9 +717,13 @@ impl ScanTask {
 /// Start importing the dialog's checked files (the dialog's OK / `ui.dialog.confirm`).
 pub fn start(app: &mut LightcraftApp, d: &ImportDialog) -> Result<Value, String> {
     busy_synchronizing(app)?;
-    let queue = d.selected_paths();
+    if scan_running(app) {
+        // duplicates are unknown until the scan finishes: nothing to import yet
+        return Err("still scanning".into());
+    }
+    let queue = d.checked_paths();
     if queue.is_empty() {
-        return Err("no photos selected".into());
+        return Err("no photos checked".into());
     }
     let undo0 = app.session.undo.len();
     let mut album = d.album;
@@ -918,9 +1053,9 @@ pub fn body(app: &mut LightcraftApp, ui: &mut egui::Ui, d: &mut ImportDialog) {
     let trashed = d.trashed.iter().filter(|t| **t).count();
     // files of photos in Recently Deleted are not "already in the library": they are counted apart
     let dups = d.candidates.iter().filter(|c| c.duplicate.is_some()).count().saturating_sub(trashed);
-    let sel = d.selected_paths().len();
+    let checked = d.checked_paths().len();
     ui.horizontal(|ui| {
-        ui.label(egui::RichText::new(crate::i18n::tr_format!("{n} found · {sel} selected", n = n, sel = sel)).color(t.text));
+        ui.label(egui::RichText::new(crate::i18n::tr_format!("{n} found · {checked} checked", n = n, checked = checked)).color(t.text));
         if dups > 0 {
             ui.label(egui::RichText::new(crate::i18n::tr_format!("· {dups} already in the library", dups = dups)).color(t.text_dim));
         }
@@ -1273,8 +1408,14 @@ fn candidate_cell(app: &mut LightcraftApp, ui: &mut egui::Ui, d: &mut ImportDial
     if on {
         p.rect_stroke(img, 3.0, Stroke::new(2.0, t.accent), StrokeKind::Inside);
     }
+    // selection: the library grid's white ring, outside the checked one so both show at once
+    if d.selected[i] {
+        p.rect_stroke(img, 3.0, Stroke::new(2.0, Color32::WHITE), StrokeKind::Outside);
+    }
     // checkbox
     let cb = Rect::from_min_size(img.min + vec2(6.0, 6.0), vec2(16.0, 16.0));
+    let cb_resp = ui.interact(cb, egui::Id::new(("import-check", i)), Sense::click());
+    register(ui.ctx(), format!("import:{i}:check"), cb);
     p.rect(cb, 3.0, if on { t.accent } else { Color32::from_black_alpha(150) }, Stroke::new(1.0, Color32::from_gray(200)), StrokeKind::Inside);
     if on {
         p.line_segment([cb.left_center() + vec2(3.5, 0.5), cb.center_bottom() + vec2(-1.0, -4.0)], Stroke::new(2.0, Color32::WHITE));
@@ -1307,7 +1448,11 @@ fn candidate_cell(app: &mut LightcraftApp, ui: &mut egui::Ui, d: &mut ImportDial
         c.captured.as_deref().map(|d| format!("\n{}", d.replace('T', " "))).unwrap_or_default()
     );
     let resp = resp.on_hover_text(tip);
-    if resp.clicked() && ok {
+    // the checkbox chooses what imports (a click inside it also reaches the cell: it wins);
+    // anywhere else selects — every cell, importable or not
+    if cb_resp.clicked() {
+        d.toggle_check(i);
+    } else if resp.clicked() {
         let shift = ui.input(|input| input.modifiers.shift);
         d.click(i, shift);
     }
@@ -1544,47 +1689,108 @@ mod tests {
         assert_eq!(d.checked, [true, false, false, false, false]);
         d.check_type("JPG", true);
         assert_eq!(d.checked, [true, true, false, true, false]);
-        assert_eq!(d.selected_paths(), ["a.ARW", "a.JPG", "b.jpeg"]);
+        assert_eq!(d.checked_paths(), ["a.ARW", "a.JPG", "b.jpeg"]);
         // an unknown type changes nothing
         d.check_type("CR3", false);
         assert_eq!(d.checked, [true, true, false, true, false]);
     }
 
     #[test]
-    fn click_toggles_one_candidate() {
+    fn click_selects_one_candidate() {
         let mut d = dialog();
         d.click(1, false);
-        assert_eq!(d.checked, [true, false, true, false, true, true]);
-        d.click(1, false);
-        assert_eq!(d.checked, [true, true, true, false, true, true]);
+        assert_eq!(d.selected, [false, true, false, false, false, false]);
+        assert_eq!(d.last_clicked, Some(1));
+        assert_eq!(d.checked, [true, true, true, false, true, true], "selecting checks nothing");
+        d.click(4, false);
+        assert_eq!(d.selected, [false, false, false, false, true, false]);
+        // even a duplicate selects (it just can't be checked)
         d.click(3, false);
-        assert_eq!(d.checked, [true, true, true, false, true, true], "a duplicate can't be checked");
+        assert_eq!(d.selected, [false, false, false, true, false, false]);
+        d.click(99, false);
+        assert_eq!(d.selected, [false, false, false, true, false, false], "out of range: nothing");
     }
 
     #[test]
-    fn shift_click_sets_the_range_to_the_clicked_state() {
+    fn shift_click_selects_the_range() {
         let mut d = dialog();
         d.click(1, false);
         d.click(4, true);
-        assert_eq!(d.checked, [true, false, false, false, false, true], "1..=4 unchecked, the duplicate left alone");
-        assert_eq!(d.selected_paths(), ["img0.jpg", "img5.jpg"]);
-        // backwards from the new anchor (4) re-checks 2..=4
-        d.click(2, true);
-        assert_eq!(d.checked, [true, false, true, false, true, true]);
+        assert_eq!(d.selected, [false, true, true, true, true, false]);
+        assert_eq!(d.last_clicked, Some(1), "the anchor stays for the next Shift-click");
+        assert_eq!(d.checked, [true, true, true, false, true, true], "selecting checks nothing");
+        // backwards from the anchor re-ranges
+        d.click(0, true);
+        assert_eq!(d.selected, [true, true, false, false, false, false]);
     }
 
     #[test]
-    fn shift_click_without_an_earlier_click_toggles_one() {
+    fn shift_click_without_an_anchor_selects_one() {
         let mut d = dialog();
         d.click(2, true);
-        assert_eq!(d.checked, [true, true, false, false, true, true]);
-    }
-
-    #[test]
-    fn shift_click_with_a_stale_anchor_toggles_one() {
-        let mut d = dialog();
+        assert_eq!(d.selected, [false, false, true, false, false, false]);
         d.last_clicked = Some(99);
-        d.click(2, true);
-        assert_eq!(d.checked, [true, true, false, false, true, true]);
+        d.click(4, true);
+        assert_eq!(d.selected, [false, false, false, false, true, false], "a stale anchor selects one");
+    }
+
+    #[test]
+    fn checkbox_toggles_one_candidate() {
+        let mut d = dialog();
+        d.toggle_check(1);
+        assert_eq!(d.checked, [true, false, true, false, true, true]);
+        d.toggle_check(1);
+        assert_eq!(d.checked, [true, true, true, false, true, true]);
+        d.toggle_check(3);
+        assert_eq!(d.checked, [true, true, true, false, true, true], "a duplicate can't be checked");
+        assert!(d.selected.iter().all(|s| !s), "checking selects nothing");
+    }
+
+    #[test]
+    fn checkbox_applies_to_a_multi_selection() {
+        let mut d = dialog();
+        d.click(1, false);
+        d.click(4, true);
+        d.toggle_check(2);
+        assert_eq!(d.checked, [true, false, false, false, false, true], "1..=4 unchecked, the duplicate left alone");
+        assert_eq!(d.checked_paths(), ["img0.jpg", "img5.jpg"]);
+        // ... and back on with the same gesture
+        d.toggle_check(4);
+        assert_eq!(d.checked, [true, true, true, false, true, true]);
+    }
+
+    #[test]
+    fn checkbox_outside_the_selection_toggles_one() {
+        let mut d = dialog();
+        d.click(0, false);
+        d.click(1, true);
+        d.toggle_check(5);
+        assert_eq!(d.checked, [true, true, true, false, true, false]);
+        // a lone selected cell is just one toggle
+        d.click(0, false);
+        d.toggle_check(0);
+        assert_eq!(d.checked, [false, true, true, false, true, false]);
+    }
+
+    /// Choices made while the scan runs survive the finished scan's replacement: options
+    /// verbatim, checks and selection by path, the anchor following its photo.
+    #[test]
+    fn finishing_scan_keeps_mid_scan_choices() {
+        let cand = |path: &str| ImportCandidate { path: path.into(), name: path.into(), ..Default::default() };
+        let mut old = ImportDialog::new(vec![cand("b.png"), cand("a.png")]);
+        old.checked = vec![false, true];
+        old.selected = vec![true, false];
+        old.last_clicked = Some(0);
+        old.keywords = "trip".into();
+        old.copy = true;
+        let dup =
+            ImportCandidate { path: "a.png".into(), name: "a.png".into(), duplicate: Some("path".into()), existing: Some(7), ..Default::default() };
+        let mut d = ImportDialog::new(vec![dup, cand("b.png")]);
+        carry_over(&mut d, &old);
+        assert_eq!(d.checked, [false, false], "the duplicate stays unchecked; the uncheck is kept");
+        assert_eq!(d.selected, [false, true], "the selection followed its photo");
+        assert_eq!(d.last_clicked, Some(1), "the anchor followed its photo");
+        assert_eq!(d.keywords, "trip");
+        assert!(d.copy);
     }
 }

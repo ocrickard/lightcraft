@@ -180,6 +180,49 @@ pub struct ImportCandidate {
     pub preview_only: Option<String>,
 }
 
+impl ImportCandidate {
+    /// A candidate shown while the scan is still running: everything the probe learned, with
+    /// duplicate detection pending (the final output replaces these wholesale).
+    pub fn provisional(path: String, result: &Result<ProbeInfo, String>) -> Self {
+        let mut c = ImportCandidate { path, ..Default::default() };
+        c.name = candidate_name(&c.path);
+        match result {
+            Ok(info) => c.apply_probe(info),
+            Err(e) => c.error = Some(e.clone()),
+        }
+        c
+    }
+
+    /// Fill in what a probe learned (shared with the scan's final candidates).
+    fn apply_probe(&mut self, info: &ProbeInfo) {
+        (self.format, self.kind, self.width, self.height, self.file_size, self.captured) =
+            (info.format.clone(), info.kind, info.width, info.height, info.file_size, info.captured.clone());
+        self.preview_only = info.preview_only.clone();
+    }
+}
+
+/// A candidate's display name: its file name, or the whole path when it has none.
+fn candidate_name(path: &str) -> String {
+    Path::new(path).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| path.to_string())
+}
+
+/// The candidate for a file already in the library: a path duplicate of its photo, shown first
+/// by a streaming scan and again among the scan's final candidates.
+fn seed_candidate(by_path: &HashMap<PathBuf, (PhotoId, ImportCandidate)>, path: &str) -> Option<ImportCandidate> {
+    let (_, c) = by_path.get(Path::new(path))?;
+    let mut c = c.clone();
+    c.name = candidate_name(path);
+    Some(c)
+}
+
+/// Offer a probe result to a streaming scan (nothing to copy when nobody streams, or stopped
+/// listening).
+fn stream_probed(progress: &ScanProgress, path: &str, r: &Result<ProbeInfo, String>) {
+    if let Some(tx) = progress.updates.as_ref() {
+        let _ = tx.send(ScanEvent::Probed { path: path.to_string(), result: Box::new(r.clone()) });
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct Duplicate {
     pub path: String,
@@ -503,6 +546,7 @@ fn probe_all(probe: Option<&crate::media::FileProbe>, paths: &[String], progress
                                 break;
                             }
                             let r = probe(&paths[i]);
+                            stream_probed(progress, &paths[i], &r);
                             progress.done.fetch_add(1, Relaxed);
                             out.lock().unwrap_or_else(|e| e.into_inner())[i] = Some(r);
                         }
@@ -519,6 +563,7 @@ fn probe_all(probe: Option<&crate::media::FileProbe>, paths: &[String], progress
                 return Err("cancelled".into());
             }
             let r = probe(p);
+            stream_probed(progress, p, &r);
             progress.done.fetch_add(1, Relaxed);
             r
         })
@@ -618,12 +663,29 @@ pub struct ScanProgress {
     pub done: std::sync::atomic::AtomicUsize,
     /// Shared with the scan's row in the activity stack (its ✕ sets it).
     pub cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Streaming: each probe result (and the files already in the library) as it is known, so
+    /// the review shows photos while the scan is still running. `None` collects silently.
+    pub updates: Option<std::sync::mpsc::Sender<ScanEvent>>,
 }
 
 /// The result of [`scan_with`]: the candidates, and the probes to keep for the import that follows.
+#[derive(Clone, Debug)]
 pub struct ScanOutput {
     pub candidates: Vec<ImportCandidate>,
     pub probes: HashMap<String, ProbeInfo>,
+}
+
+/// One step of a streaming [`scan_with`] (see [`ScanProgress::updates`]): the review shows
+/// photos as they arrive and replaces them wholesale with the final [`ScanOutput`] when the
+/// scan finishes, since duplicate marks need every content hash.
+#[derive(Clone, Debug)]
+pub enum ScanEvent {
+    /// Files already in the library: known without probing, shown first and final.
+    Seed(Vec<ImportCandidate>),
+    /// A file probed (or reused from a preceding scan): shown with duplicate detection pending.
+    Probed { path: String, result: Box<Result<ProbeInfo, String>> },
+    /// The scan finished: the final candidates, probes and duplicate marks.
+    Done(ScanOutput),
 }
 
 impl ScanInput {
@@ -834,7 +896,8 @@ pub fn scan(s: &mut Session, paths: &[String]) -> Vec<ImportCandidate> {
 }
 
 /// [`scan`] without the session, so it can run on a worker thread. Stops early (returning what it
-/// has) when `progress.cancel` is set.
+/// has) when `progress.cancel` is set. When [`ScanProgress::updates`] is set, the files already
+/// in the library and each probe result go out as they are known, ahead of the returned output.
 pub fn scan_with(mut input: ScanInput, paths: &[String], progress: &ScanProgress) -> ScanOutput {
     use std::sync::atomic::Ordering::Relaxed;
     let files = expand(paths, input.skip.as_deref());
@@ -851,6 +914,19 @@ pub fn scan_with(mut input: ScanInput, paths: &[String], progress: &ScanProgress
         .collect();
     let missing: Vec<String> = todo.iter().zip(&cached).filter(|(_, c)| c.is_none()).map(|(f, _)| f.clone()).collect();
     progress.done.store(todo.len() - missing.len(), Relaxed);
+    // streaming: what needs no probing goes out first (files already in the library, then the
+    // reused probes); fresh probes stream from `probe_all` as they complete
+    if let Some(tx) = progress.updates.as_ref() {
+        let seed: Vec<ImportCandidate> = files.iter().filter_map(|f| seed_candidate(&input.by_path, f)).collect();
+        if !seed.is_empty() {
+            let _ = tx.send(ScanEvent::Seed(seed));
+        }
+        for (f, c) in todo.iter().zip(cached.iter()) {
+            if let Some(info) = c {
+                let _ = tx.send(ScanEvent::Probed { path: f.clone(), result: Box::new(Ok(info.clone())) });
+            }
+        }
+    }
     let probe = input.scan_probe.as_ref().or(input.probe.as_ref());
     let mut fresh = probe_all(probe, &missing, progress).into_iter();
     let probed: Vec<Result<ProbeInfo, String>> =
@@ -875,19 +951,14 @@ pub fn scan_with(mut input: ScanInput, paths: &[String], progress: &ScanProgress
     let mut out = Vec::with_capacity(files.len());
     let mut kept = HashMap::new();
     for f in files {
-        if let Some((_, c)) = input.by_path.get(Path::new(&f)) {
-            let mut c = c.clone();
-            c.name = Path::new(&f).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| f.clone());
+        if let Some(c) = seed_candidate(&input.by_path, &f) {
             out.push(c);
             continue;
         }
-        let name = Path::new(&f).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| f.clone());
-        let mut c = ImportCandidate { path: f.clone(), name, ..Default::default() };
+        let mut c = ImportCandidate { path: f.clone(), name: candidate_name(&f), ..Default::default() };
         match probes.remove(&f) {
             Some(Ok(info)) => {
-                (c.format, c.kind, c.width, c.height, c.file_size, c.captured) =
-                    (info.format.clone(), info.kind, info.width, info.height, info.file_size, info.captured.clone());
-                c.preview_only = info.preview_only.clone();
+                c.apply_probe(&info);
                 if let Some(h) = &info.content_hash {
                     match seen_hash.get(h) {
                         Some(existing) => {

@@ -255,6 +255,81 @@ fn scan_fill_matches_library_by_content() {
     let _ = std::fs::remove_dir_all(&other);
 }
 
+/// A streaming scan reports every file before it finishes (the seed, then each probe as it
+/// completes — one arrives while the rest are still gated), and finishes with the same output
+/// as a silent scan.
+#[test]
+fn streaming_scan_reports_every_file_then_matches_a_silent_scan() {
+    use crate::import::{ScanEvent, ScanInput, ScanProgress, scan_with};
+    use std::time::Duration;
+    let src = temp_dir("scanstream");
+    std::fs::write(src.join("a.png"), vec![0xAu8; 100]).unwrap();
+    std::fs::copy(src.join("a.png"), src.join("twin.png")).unwrap(); // same bytes, another path
+    std::fs::write(src.join("b.png"), vec![0xBu8; 200]).unwrap();
+    std::fs::write(src.join("broken.jpg"), vec![0xCu8; 50]).unwrap();
+    let mut s = Session::new().with_fs();
+    s.media.scan_probe = Some(size_probe());
+    s.execute("library.import", &json!({"paths": [src.join("a.png").to_string_lossy()]})).unwrap();
+    // the stub passes b.png; the rest wait for the test (broken.jpg then fails to probe)
+    let gate = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let g = gate.clone();
+    s.media.scan_probe = Some(std::sync::Arc::new(move |p: &str| {
+        if !p.ends_with("b.png") {
+            while !g.load(std::sync::atomic::Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        if p.ends_with("broken.jpg") {
+            return Err("unreadable in this test".into());
+        }
+        Ok(crate::media::ProbeInfo {
+            file_size: std::fs::metadata(p).map(|m| m.len()).unwrap_or(0),
+            format: "PNG".into(),
+            width: 40,
+            height: 30,
+            ..Default::default()
+        })
+    }));
+    let (input, paths) = ScanInput::new(&mut s, &[src.to_string_lossy().to_string()]);
+    let (tx, rx) = std::sync::mpsc::channel();
+    let progress = ScanProgress { updates: Some(tx), ..Default::default() };
+    let h = std::thread::spawn(move || scan_with(input, &paths, &progress));
+    let mut seed = Vec::new();
+    let mut probed = Vec::new();
+    while probed.is_empty() {
+        match rx.recv_timeout(Duration::from_secs(10)).expect("an event while gated") {
+            ScanEvent::Seed(found) => seed.extend(found),
+            ScanEvent::Probed { path, result } => probed.push((path, result.is_ok())),
+            ScanEvent::Done(_) => panic!("finished behind a closed gate"),
+        }
+    }
+    assert!(!h.is_finished(), "the scan is still running");
+    gate.store(true, std::sync::atomic::Ordering::Relaxed);
+    let out = h.join().expect("scan");
+    while let Ok(ev) = rx.try_recv() {
+        match ev {
+            ScanEvent::Seed(found) => seed.extend(found),
+            ScanEvent::Probed { path, result } => probed.push((path, result.is_ok())),
+            ScanEvent::Done(_) => {}
+        }
+    }
+    assert_eq!(seed.iter().map(|c| c.name.clone()).collect::<Vec<_>>(), ["a.png"]);
+    assert_eq!(seed[0].duplicate.as_deref(), Some("path"));
+    let mut probed_paths: Vec<String> = probed.iter().map(|(p, _)| Path::new(p).file_name().unwrap().to_string_lossy().to_string()).collect();
+    probed_paths.sort();
+    assert_eq!(probed_paths, ["b.png", "broken.jpg", "twin.png"]);
+    assert!(probed.iter().find(|(p, _)| p.ends_with("broken.jpg")).is_some_and(|(_, ok)| !ok), "probe errors stream too");
+    // the finish matches a silent scan exactly (twin duplicates the library photo by content)
+    let (input, paths) = ScanInput::new(&mut s, &[src.to_string_lossy().to_string()]);
+    let silent = scan_with(input, &paths, &ScanProgress::default());
+    assert_eq!(out.candidates, silent.candidates);
+    assert_eq!(out.candidates.len(), 4);
+    let dup_of = |name: &str| out.candidates.iter().find(|c| c.name == name).unwrap().duplicate.clone();
+    assert_eq!(dup_of("twin.png").as_deref(), Some("content"));
+    assert!(out.candidates.iter().find(|c| c.name == "broken.jpg").unwrap().error.is_some());
+    let _ = std::fs::remove_dir_all(&src);
+}
+
 #[test]
 fn copy_into_library_and_persist() {
     let src = temp_dir("copysrc");

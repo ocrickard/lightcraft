@@ -1307,7 +1307,7 @@ pub fn run_ui_command(app: &mut LightcraftApp, id: &str, p: &Value) -> Option<Re
                 return Some(Ok(Value::Null));
             }
             // review first: the import dialog lists what was found
-            crate::import::open(app, paths)
+            crate::import::open(app, paths, false)
         }
         "file.importLightroom" => {
             let path = match p.get("path").and_then(Value::as_str).map(str::to_string) {
@@ -1469,14 +1469,7 @@ pub fn run_ui_command(app: &mut LightcraftApp, id: &str, p: &Value) -> Option<Re
                     None => return Some(Err("no camera or memory card found".into())),
                 },
             };
-            let r = crate::import::open(app, vec![path]);
-            // only the scan just started (an error means another scan is running)
-            if r.is_ok()
-                && let Some(t) = &mut app.scan
-            {
-                t.copy = true;
-            }
-            r
+            crate::import::open(app, vec![path], true)
         }
         "file.addFolder" => {
             // a folder (searched recursively) into the import review
@@ -1490,7 +1483,7 @@ pub fn run_ui_command(app: &mut LightcraftApp, id: &str, p: &Value) -> Option<Re
                 },
             };
             match path {
-                Some(path) => crate::import::open(app, vec![path]),
+                Some(path) => crate::import::open(app, vec![path], false),
                 None => Ok(Value::Null),
             }
         }
