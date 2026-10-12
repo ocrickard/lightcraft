@@ -28,11 +28,17 @@ libraries. Measured on one real file (`DSCF9492.RAF`, 56.5 MB) over a GVFS/SMB s
 4. When the prefix already covers the range — the usual case, since it was grown to it — the window
    is a slice of the prefix. Reading it again would double a 5.6 MB preview.
 
-Formats whose preview pointer is not in the header (CR3 scans boxes; a TIFF pointer tag can sit in
-an IFD the prefix cuts short; CRW/MRW/X3F are found by scanning) keep the whole-file path, so
-nothing regresses: `preview_window` returns `None` and the loader reads the file as before. A pointer
-that lies, a short read or a file that changes underneath us ends in the same fallback — the user's
-preview is never lost to a damaged header.
+Hasselblad 3FR takes the same path: IFD0 is the preview (one JPEG strip holding the whole
+thumbnail) and sits in the header with the tables that prove it, so the 4 KiB prefix locates the
+~2 MB window — 1 % of a 212 MB CFV 100C file, byte-identical pixels. Anything the header cannot
+mirror exactly (another maker, several strips, a vendor maker note, a table the prefix cuts
+short) falls back instead.
+
+Formats whose preview pointer is not in the header (CR3 scans boxes; other TIFF pointer tags
+can sit in an IFD the prefix cuts short; CRW/MRW/X3F are found by scanning) keep the whole-file
+path, so nothing regresses: `preview_window` returns `None` and the loader reads the file as
+before. A pointer that lies, a short read or a file that changes underneath us ends in the same
+fallback — the user's preview is never lost to a damaged header.
 
 `LIGHTCRAFT_PROFILE=1` prints what each preview cost:
 
