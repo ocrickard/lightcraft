@@ -1403,6 +1403,12 @@ fn candidate_cell(app: &mut LightcraftApp, ui: &mut egui::Ui, d: &mut ImportDial
         let fit = Rect::from_center_size(img.center(), vec2(tw as f32 * s, th as f32 * s));
         let tint = if ok { Color32::WHITE } else { Color32::from_gray(110) };
         p.image(tex.tex.id(), fit, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), tint);
+    } else if app.renderer.failure(slot).is_some() {
+        // unreadable: the library grid's mark
+        p.text(img.center(), Align2::CENTER_CENTER, "!", t.semibold(18.0), t.text_dim);
+    } else if app.renderer.is_pending(slot) {
+        // still loading: a spinner, which repaints itself until the texture arrives
+        egui::Spinner::new().size(22.0).color(t.text_dim).paint_at(ui, Rect::from_center_size(img.center(), vec2(24.0, 24.0)));
     }
     let on = d.checked[i] && ok;
     if on {

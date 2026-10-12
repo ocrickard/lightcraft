@@ -693,16 +693,26 @@ fn fit_box(max_edge: usize) -> lightcraft_codecs::DecodeOptions {
 ///
 /// The quick path reads the file's header and its embedded preview and nothing else (see
 /// [`preview_window`]); a format whose preview the header cannot point at falls back to the
-/// whole-file path, which is what every format used to cost. The memory gate still counts the whole
-/// file, which is what the decode of one can hold.
+/// whole-file path, which is what every format used to cost. The memory-gate permit is sized by
+/// the bytes actually read, not the file: a 200 MB 3FR's header read holds a few megabytes, and
+/// counting the whole file would serialize every background thumbnail behind the gate — each
+/// permit bigger than the limit, so an import grid of Hasselblad files loads one preview at a
+/// time while the pool's other workers wait.
 pub fn fs_preview_loader() -> PreviewLoader {
     Arc::new(|path: &str, max_edge: usize| {
-        let len = std::fs::metadata(path).map(|m| usize::try_from(m.len()).unwrap_or(usize::MAX)).unwrap_or(0);
         let gate = crate::memory::work_gate();
-        let _permit = if crate::memory::is_background() { gate.acquire(len.saturating_mul(2)) } else { gate.acquire_urgent(len.saturating_mul(2)) };
-        if let Some(image) = preview_window(path).ok().flatten().and_then(|(header, window, _)| quick_image_srgb(&header, &window, max_edge)) {
-            return Some(image);
+        let background = crate::memory::is_background();
+        // The header path's reads are small (a 4 KiB prefix plus the preview window), so they run
+        // ahead of the permit; the decode below is counted, sized by those bytes.
+        if let Ok(Some((header, window, read))) = preview_window(path) {
+            let bytes = usize::try_from(read.read).unwrap_or(usize::MAX).saturating_mul(2);
+            let _permit = if background { gate.acquire(bytes) } else { gate.acquire_urgent(bytes) };
+            if let Some(image) = quick_image_srgb(&header, &window, max_edge) {
+                return Some(image);
+            }
         }
+        let len = std::fs::metadata(path).map(|m| usize::try_from(m.len()).unwrap_or(usize::MAX)).unwrap_or(0);
+        let _permit = if background { gate.acquire(len.saturating_mul(2)) } else { gate.acquire_urgent(len.saturating_mul(2)) };
         embedded_preview_srgb(&std::fs::read(path).ok()?, max_edge)
     })
 }
@@ -1105,6 +1115,97 @@ mod tests {
         std::fs::write(&plain, &jpeg).unwrap();
         assert!(preview_window(&plain.to_string_lossy()).expect("a plain file reads").is_none());
         assert!(preview_window(&dir.join("nope.raf").to_string_lossy()).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A minimal Hasselblad-shaped TIFF: IFD0 is a single-JPEG-strip preview (like a 3FR's),
+    /// the SubIFD an uncompressed mosaic, EXIF a headerless note; the JPEG sits past the 4 KiB
+    /// prefix and a raw tail follows it, so a test can prove the header alone locates the preview.
+    fn tiff_3fr_with_embedded_jpeg(jpeg: &[u8], tail: usize) -> Vec<u8> {
+        fn entry(tag: u16, typ: u16, cnt: u32, val: u32) -> Vec<u8> {
+            let mut e = Vec::with_capacity(12);
+            e.extend_from_slice(&tag.to_le_bytes());
+            e.extend_from_slice(&typ.to_le_bytes());
+            e.extend_from_slice(&cnt.to_le_bytes());
+            e.extend_from_slice(&val.to_le_bytes());
+            e
+        }
+        let make = b"Hasselblad\0";
+        let mut f = vec![0u8; 8];
+        f[..4].copy_from_slice(b"II\x2A\x00");
+        f[4..8].copy_from_slice(&8u32.to_le_bytes());
+        let make_at = 8 + 2 + 8 * 12 + 4;
+        let sub_at = make_at + make.len() as u32;
+        let exif_at = sub_at + (2 + 5 * 12 + 4) as u32;
+        let note_at = exif_at + (2 + 12 + 4) as u32;
+        let note_len = 2048u32;
+        let jpeg_off = 6000u32;
+        let mut ifd0 = (8u16).to_le_bytes().to_vec();
+        for e in [
+            entry(0x0100, 3, 1, 3888),
+            entry(0x0101, 3, 1, 2918),
+            entry(0x0103, 3, 1, 7),
+            entry(0x010F, 2, make.len() as u32, make_at),
+            entry(0x0111, 4, 1, jpeg_off),
+            entry(0x0117, 4, 1, jpeg.len() as u32),
+            entry(0x014A, 4, 1, sub_at),
+            entry(0x8769, 4, 1, exif_at),
+        ] {
+            ifd0.extend(e);
+        }
+        ifd0.extend(0u32.to_le_bytes());
+        f.extend(ifd0);
+        f.extend_from_slice(make);
+        let mut sub = (5u16).to_le_bytes().to_vec();
+        for e in
+            [entry(0x0100, 3, 1, 11904), entry(0x0101, 3, 1, 8842), entry(0x0103, 3, 1, 1), entry(0x0111, 4, 1, 16384), entry(0x0117, 4, 1, 1000)]
+        {
+            sub.extend(e);
+        }
+        sub.extend(0u32.to_le_bytes());
+        f.extend(sub);
+        let mut exif = (1u16).to_le_bytes().to_vec();
+        exif.extend(entry(0x927C, 7, note_len, note_at));
+        exif.extend(0u32.to_le_bytes());
+        f.extend(exif);
+        f.extend(std::iter::repeat_n(0x23u8, note_len as usize));
+        assert!(f.len() < jpeg_off as usize, "the header stays inside the prefix");
+        f.resize(jpeg_off as usize, 0x33);
+        f.extend_from_slice(jpeg);
+        f.extend(std::iter::repeat_n(0x44u8, tail));
+        f
+    }
+
+    /// A 3FR-shaped file's preview is read from its header and its JPEG only, and the loader the
+    /// import grid uses answers from that read: byte for byte what the whole-file path decodes.
+    /// (The loader sizes its memory-gate permit by the bytes read, not the file, so a grid of
+    /// 200 MB 3FR files loads its previews side by side instead of one at a time; the concurrency
+    /// itself is timing the suite cannot assert, but the pixels it must not change are here.)
+    #[test]
+    fn preview_loader_serves_a_3fr_from_its_header_read() {
+        let (w, h) = (48u32, 32u32);
+        let rgb: Vec<u8> = (0..w * h * 3).map(|i| (i * 13 % 251) as u8).collect();
+        let img = EncodeImage::new(w, h, 3, Samples::U8(&rgb));
+        let jpeg = encode_jpeg(&img, 90, ChromaSubsampling::S420, &EncodeMeta::default()).unwrap();
+        let file = tiff_3fr_with_embedded_jpeg(&jpeg, 200_000);
+        let dir = crate::tests_xmp::temp_dir("preview-window-3fr");
+        let path = dir.join("a1d_000123.3fr");
+        std::fs::write(&path, &file).unwrap();
+        let path = path.to_string_lossy().into_owned();
+        let max_edge = 512;
+
+        let (header, window, read) = preview_window(&path).expect("the file reads").expect("it has a preview");
+        assert_eq!(header.len(), lightcraft_raw::PREVIEW_PREFIX, "the header prefix is bounded");
+        assert!(read.header_path, "the header path is what answered");
+        assert_eq!(read.total, file.len() as u64);
+        assert!(read.fraction() < 0.5, "the read is a fraction of the file: {read:?}");
+        assert!(window.len() < file.len() / 2, "the raw tail must not be read: {} of {} bytes", window.len(), file.len());
+
+        // The loader the grid calls, against the whole-file decode: byte for byte.
+        let loaded = fs_preview_loader()(&path, max_edge).expect("the loader answers from the header read");
+        let whole = embedded_preview_srgb(&file, max_edge).expect("the whole file decodes too");
+        assert_eq!((loaded.width, loaded.height), (whole.width, whole.height), "same preview size");
+        assert_eq!(loaded.data, whole.data, "byte for byte");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
