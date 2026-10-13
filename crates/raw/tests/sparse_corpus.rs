@@ -7,9 +7,14 @@
 //! reader that looked at skipped data would be caught. CR3 and DNG files must be described from a
 //! small part of the file (`cargo test -p lightcraft-raw --release --test sparse_corpus -- --nocapture`
 //! prints what each format reads).
+//!
+//! [`bounded_preview`]'s header answer — when a sample's format has one — must likewise be the
+//! whole file's preview: the same promise, made by the header walk in `preview.rs` rather than
+//! by the sparse plan, so it is checked wherever a sample exercises it. (RAF answers through
+//! the engine's prefix growth instead; its 4 KiB answer is deliberately short.)
 
 use lightcraft_raw::sparse::{HeaderPlan, Ranges, header_plan, preview_plan};
-use lightcraft_raw::{embedded_preview, probe, probe_info};
+use lightcraft_raw::{PREVIEW_PREFIX, bounded_preview, embedded_preview, embedded_preview_from_range, probe, probe_info};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -64,10 +69,26 @@ fn partial_reads_describe_raws_as_whole_files_do() {
     paths.sort();
     // format → (files ready, bytes read, bytes total, files read whole)
     let mut stats: BTreeMap<String, (usize, u64, u64, usize)> = BTreeMap::new();
+    let mut header_previews = 0usize;
     for p in paths {
         let name = p.file_name().unwrap().to_string_lossy().to_string();
         let file = std::fs::read(&p).unwrap();
         let format = probe(&file).map_or("?".to_string(), |f| format!("{f:?}"));
+        // the header preview walk's answer, where a sample exercises it, is the whole file's
+        // preview (RAF is skipped: its caller grows the prefix past PREVIEW_PREFIX first)
+        if !file.starts_with(b"FUJIFILMCCD-RAW")
+            && let Some(range) = bounded_preview(&file[..file.len().min(PREVIEW_PREFIX)])
+        {
+            header_previews += 1;
+            let window = file
+                .get(range.offset as usize..(range.offset + range.window_len) as usize)
+                .unwrap_or_else(|| panic!("{name}: header range {range:?} outside the file"));
+            assert_eq!(
+                embedded_preview_from_range(window, range),
+                embedded_preview(&file),
+                "{name}: the header preview differs from the whole file's"
+            );
+        }
         let (plan, zeros, loaded) = run(&file, 0, false);
         let entry = stats.entry(format.clone()).or_default();
         match plan {
@@ -105,4 +126,5 @@ fn partial_reads_describe_raws_as_whole_files_do() {
     for (format, (ready, read, total, whole)) in stats {
         eprintln!("{format:>10}: {ready} described from {:.1} % of their bytes, {whole} read whole", read as f64 * 100.0 / total.max(1) as f64);
     }
+    eprintln!("header previews checked against the whole file: {header_previews}");
 }

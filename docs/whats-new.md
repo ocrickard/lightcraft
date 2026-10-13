@@ -4,10 +4,19 @@
 
 ### Fast import scan from camera cards
 - Import from Device no longer reads every byte of every file to show the review grid: the scan
-  reads headers only (0.3 % of a 212 MB Hasselblad 3FR), hashing just the files whose size
-  another file shares. A card of 1501 3FR files scans in under a minute instead of about two
-  hours. Duplicate detection, copy verification, and every imported photo's content hash work
-  as before.
+  reads headers only (0.3 % of a 212 MB Hasselblad 3FR), telling same-size files apart by a
+  small head sample and hashing whole only what the samples cannot distinguish. A card of
+  1501 3FR files scans in under a minute instead of about two hours. Duplicate detection and
+  copy verification work as before, and imported photos keep their content hashes.
+- The import review opens while the scan is still running: photos join the grid as they are
+  found, and choices made meanwhile carry over when the scan finishes. Importing waits for
+  the scan, since duplicates are only known then.
+- In the review grid a click now selects a photo (the white ring; Shift-click selects a range)
+  and the checkbox alone chooses what imports (the blue ring). Ticking one photo of a
+  multi-photo selection ticks them all.
+- Hasselblad 3FR previews come from the file header and its embedded JPEG (about 1 % of a
+  212 MB file), import thumbnails load side by side instead of one at a time, and a cell
+  whose thumbnail is still loading shows a spinner (and the grid's ! when it fails).
 
 ### JPEG XL export
 - Export as JPEG XL (issue #247): Format ▸ JPEG XL in the Export dialog, `format: "jxl"` for agents and the CLI

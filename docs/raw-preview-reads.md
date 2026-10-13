@@ -28,11 +28,14 @@ libraries. Measured on one real file (`DSCF9492.RAF`, 56.5 MB) over a GVFS/SMB s
 4. When the prefix already covers the range — the usual case, since it was grown to it — the window
    is a slice of the prefix. Reading it again would double a 5.6 MB preview.
 
-Hasselblad 3FR takes the same path: IFD0 is the preview (one JPEG strip holding the whole
-thumbnail) and sits in the header with the tables that prove it, so the 4 KiB prefix locates the
-~2 MB window — 1 % of a 212 MB CFV 100C file, byte-identical pixels. Anything the header cannot
-mirror exactly (another maker, several strips, a vendor maker note, a table the prefix cuts
-short) falls back instead.
+Hasselblad 3FR takes the same path (measured on the author's 907X CFV 100C files; the
+downloadable CC0 corpus has no 3FR sample yet): IFD0 is the preview (one JPEG strip holding
+the whole thumbnail) and sits in the header with the tables that prove it, so the 4 KiB prefix
+locates the ~2 MB window — 1 % of a 212 MB file, byte-identical pixels on the measured files.
+Anything the header cannot mirror (another maker, several strips, a vendor maker note, a
+table the prefix cuts short) falls back instead; a headerless maker note is tried as a plain
+IFD by the whole-file search and skipped by the header rule, so a body that hid a larger
+preview only there would get IFD0's preview from the header path.
 
 Formats whose preview pointer is not in the header (CR3 scans boxes; other TIFF pointer tags
 can sit in an IFD the prefix cuts short; CRW/MRW/X3F are found by scanning) keep the whole-file
