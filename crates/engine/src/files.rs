@@ -865,14 +865,25 @@ impl ProbeRead {
 /// cannot describe from part of the file (small files, formats whose header probe reads samples,
 /// an unclear structure) is read whole, exactly as before.
 ///
-/// The probe carries no content hash: hashing needs the bytes this skips. The import fills hashes
-/// in for the few files whose size another file shares — different sizes cannot hold the same
-/// bytes — and hashes the rest while copying or adding them.
+/// The probe carries no content hash: hashing needs the bytes this skips. Files whose size
+/// another file shares are told apart by a head sample first, and only what the samples cannot
+/// tell apart is hashed whole (the hash fill in [`crate::import`]); the rest are hashed while
+/// the import copies or adds them.
+///
+/// Memory is counted like the preview loader's ([`fs_preview_loader`]): the sparse buffer is
+/// the file's full length — TIFF offsets are absolute and the probe takes a `&[u8]` — but only
+/// the loaded ranges are populated, so a sparse probe's permit covers the bytes read, taken
+/// after the read. The whole-file fallback counts the file, with its permit taken before that
+/// read begins ([`load_probe_ranges`] says when), exactly as the whole-file probe it replaces.
 pub fn fs_scan_probe() -> FileProbe {
     Arc::new(|path: &str| {
-        let total = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-        let _permit = crate::memory::work_gate().acquire(usize::try_from(total).unwrap_or(usize::MAX));
-        let (bytes, read) = load_probe_bytes(path)?;
+        let gate = crate::memory::work_gate();
+        let mut whole_permit: Option<crate::memory::Permit<'static>> = None;
+        let (bytes, read) = load_probe_bytes(path, &mut |total| {
+            whole_permit = Some(gate.acquire(usize::try_from(total).unwrap_or(usize::MAX)));
+        })?;
+        let _whole_permit = whole_permit;
+        let _permit = if read.sparse { Some(gate.acquire(usize::try_from(read.read).unwrap_or(usize::MAX))) } else { None };
         if lightcraft_pipeline::profiling() {
             eprintln!(
                 "[profile] probe {path}: read {} of {} bytes ({:.1}%, {})",
@@ -888,25 +899,34 @@ pub fn fs_scan_probe() -> FileProbe {
 
 /// The bytes [`fs_scan_probe`] probes: the header ranges of the file in a buffer of its full
 /// length (the rest zeros), or the whole file when the header plan declines it. Also what was
-/// read, for [`ProbeRead`].
-fn load_probe_bytes(path: &str) -> Result<(Vec<u8>, ProbeRead), String> {
+/// read, for [`ProbeRead`]. `before_whole` runs (with the file's size) just before a whole-file
+/// read begins, so the caller can count that memory first.
+fn load_probe_bytes(path: &str, before_whole: &mut dyn FnMut(u64)) -> Result<(Vec<u8>, ProbeRead), String> {
     let mut file = std::fs::File::open(path).map_err(|e| format!("{path}: {e}"))?;
     let total = file.metadata().map_err(|e| format!("{path}: {e}"))?.len();
-    load_probe_ranges(&mut file, total).map_err(|e| format!("{path}: {e}"))
+    load_probe_ranges(&mut file, total, before_whole).map_err(|e| format!("{path}: {e}"))
 }
 
 /// [`load_probe_bytes`] over any seekable reader (tests count the bytes). A file that fits the
 /// first prefix is read whole, as is anything whose plan never settles or names a range outside
 /// the file — the probe of those is exactly the probe of a full read.
-fn load_probe_ranges<R: std::io::Read + std::io::Seek>(r: &mut R, total: u64) -> std::io::Result<(Vec<u8>, ProbeRead)> {
+fn load_probe_ranges<R: std::io::Read + std::io::Seek>(
+    r: &mut R,
+    total: u64,
+    before_whole: &mut dyn FnMut(u64),
+) -> std::io::Result<(Vec<u8>, ProbeRead)> {
     use std::io::SeekFrom;
     let len = usize::try_from(total).map_err(|_| std::io::Error::other("file too large"))?;
     if total <= PROBE_PREFIX {
+        before_whole(total);
         let mut bytes = vec![0u8; len];
         r.seek(SeekFrom::Start(0))?;
         r.read_exact(&mut bytes)?;
         return Ok((bytes, ProbeRead { read: total, total, sparse: false }));
     }
+    // The buffer is the file's full length (the bytes the plan does not name stay zero):
+    // offsets in its tables are absolute and the probe takes a whole-file `&[u8]`.
+    // Only the ranges the plan names are read into it.
     let mut bytes = vec![0u8; len];
     let mut loaded = lightcraft_raw::sparse::Ranges::new();
     let prefix = PROBE_PREFIX as usize;
@@ -931,6 +951,7 @@ fn load_probe_ranges<R: std::io::Read + std::io::Seek>(r: &mut R, total: u64) ->
             lightcraft_raw::sparse::HeaderPlan::Whole(_) => break 'plan,
         }
     }
+    before_whole(total);
     r.seek(SeekFrom::Start(0))?;
     r.read_exact(&mut bytes)?;
     read += total;
@@ -1271,7 +1292,9 @@ mod tests {
         let bytes = crate::tests_xmp::synthetic_dng_of(w, h, "RGGB", data, None, Default::default());
         assert!(bytes.len() as u64 > PROBE_PREFIX * 4, "fixture too small to prove anything: {}", bytes.len());
         let mut counting = CountingReader { inner: std::io::Cursor::new(bytes.as_slice()), read: 0 };
-        let (sparse, probe_read) = load_probe_ranges(&mut counting, bytes.len() as u64).unwrap();
+        let mut whole = None;
+        let (sparse, probe_read) = load_probe_ranges(&mut counting, bytes.len() as u64, &mut |t| whole = Some(t)).unwrap();
+        assert_eq!(whole, None, "a sparse read never counts the whole file");
         assert!(probe_read.sparse, "fell back to a whole read");
         assert!(probe_read.read <= PROBE_PREFIX + 256 * 1024, "read {} of {} bytes", probe_read.read, bytes.len());
         assert_eq!(counting.read, probe_read.read, "bytes pulled, counted twice");
@@ -1305,7 +1328,9 @@ mod tests {
         let jpeg = encode_jpeg(&img, 90, ChromaSubsampling::S420, &EncodeMeta::default()).unwrap();
         assert!(jpeg.len() as u64 > PROBE_PREFIX, "fixture too small to prove anything: {}", jpeg.len());
         let mut counting = CountingReader { inner: std::io::Cursor::new(jpeg.as_slice()), read: 0 };
-        let (bytes, probe_read) = load_probe_ranges(&mut counting, jpeg.len() as u64).unwrap();
+        let mut whole = None;
+        let (bytes, probe_read) = load_probe_ranges(&mut counting, jpeg.len() as u64, &mut |t| whole = Some(t)).unwrap();
+        assert_eq!(whole, Some(jpeg.len() as u64), "the caller counts the file before it is read whole");
         assert!(!probe_read.sparse);
         assert_eq!(bytes, jpeg);
         let dir = crate::tests_xmp::temp_dir("scan-probe-whole");
