@@ -232,15 +232,19 @@ pub fn bounded_preview(bytes: &[u8]) -> Option<PreviewRange> {
 
 /// A Hasselblad 3FR's preview range from its header alone.
 ///
-/// Layout (measured on a 907X CFV 100C file; everything below sits in the first 4 KiB): IFD0
-/// is the preview — 3888×2918, JPEG compression, one strip holding the whole JPEG at the
-/// file's tail; the SubIFD is the uncompressed raw mosaic; the EXIF IFD carries no preview
-/// pointers and the maker note no JPEG. The rule returns the largest single-JPEG window the
-/// main chain, SubIFDs and EXIF/GPS/Interop IFDs name — exactly what [`embedded_preview`]
-/// finds for such a file — and `None` (read the file whole) unless every IFD it would
-/// consult lies fully inside the prefix with nothing it cannot mirror exactly: a JPEG IFD
-/// that is not one strip, JPEG tiles, a half-readable pointer pair, a maker note that parses
-/// (Hasselblad's does not), or anything past the prefix at all.
+/// Layout (measured on the author's 907X CFV 100C files; everything below sits in the first
+/// 4 KiB): IFD0 is the preview — 3888×2918, JPEG compression, one strip holding the whole
+/// JPEG at the file's tail; the SubIFD is the uncompressed raw mosaic; the EXIF IFD carries
+/// no preview pointers and the maker note no JPEG. The rule returns the largest single-JPEG
+/// window the main chain, SubIFDs and EXIF/GPS/Interop IFDs name — the window
+/// [`embedded_preview`] finds for the measured files — and `None` (read the file whole)
+/// unless every IFD it would consult lies fully inside the prefix with nothing it cannot
+/// mirror: a JPEG IFD that is not one strip, JPEG tiles, a half-readable pointer pair, a
+/// vendor maker note (Hasselblad's is headerless and holds no preview on the measured body;
+/// the whole-file search also tries it as a plain IFD, which the header rule does not), or
+/// anything past the prefix at all. A body that hid a larger preview only in its maker note
+/// would get the IFD0 preview from the header path; the caller still validates the window
+/// as a DCT JPEG and falls back to the whole file if it is not one.
 fn hasselblad_preview_range(bytes: &[u8]) -> Option<PreviewRange> {
     let order = if bytes.starts_with(b"II\x2A\x00") {
         ByteOrder::Little
@@ -254,18 +258,33 @@ fn hasselblad_preview_range(bytes: &[u8]) -> Option<PreviewRange> {
     let mut off = order.read_u32(bytes, 4)? as u64;
     let mut first = true;
     while off != 0 {
-        off = hasselblad_ifd(bytes, order, off, first, &mut seen, &mut best)?;
+        off = hasselblad_ifd(bytes, order, off, first, 0, &mut seen, &mut best)?;
         first = false;
     }
     let (offset, window_len) = best?;
     (window_len > 0).then_some(PreviewRange { offset, window_len })
 }
 
+/// How deep the header walk follows child IFDs, and how many IFDs it visits in all — the
+/// TIFF parser's own limits (`ParseOptions::default` in `lightcraft_tiff::reader`), so a
+/// crafted prefix can neither recurse without bound nor keep the walk busy. The caller
+/// passes a 4 KiB prefix, but [`bounded_preview`] accepts more.
+const MAX_HEADER_IFD_DEPTH: usize = 10;
+const MAX_HEADER_IFDS: usize = 1024;
+
 /// Scan the IFD at `off`: collect its JPEG windows into `best` and follow its child IFDs.
-/// Returns the next IFD's offset. `None` means "this rule cannot mirror the file exactly":
+/// Returns the next IFD's offset. `None` means "this rule cannot mirror the file":
 /// read it whole instead.
-fn hasselblad_ifd(bytes: &[u8], order: ByteOrder, off: u64, is_ifd0: bool, seen: &mut HashSet<u64>, best: &mut Option<(u64, u64)>) -> Option<u64> {
-    if !seen.insert(off) {
+fn hasselblad_ifd(
+    bytes: &[u8],
+    order: ByteOrder,
+    off: u64,
+    is_ifd0: bool,
+    depth: usize,
+    seen: &mut HashSet<u64>,
+    best: &mut Option<(u64, u64)>,
+) -> Option<u64> {
+    if depth > MAX_HEADER_IFD_DEPTH || seen.len() >= MAX_HEADER_IFDS || !seen.insert(off) {
         return None;
     }
     let off = usize::try_from(off).ok()?;
@@ -305,10 +324,14 @@ fn hasselblad_ifd(bytes: &[u8], order: ByteOrder, off: u64, is_ifd0: bool, seen:
     }
     // JPEG strips: exactly one strip, mirroring the whole-file search's single chunk. Several
     // strips (which the search skips unless they merge) or JPEG tiles fall back instead.
-    match find(t::COMPRESSION).map(|e| single_value(bytes, order, e)) {
-        None => {}
-        Some(None) => return None,
-        Some(Some(6 | 7 | 34892)) => {
+    if let Some(e) = find(t::COMPRESSION) {
+        let compression = single_value(bytes, order, e)?;
+        if compression == t::compression::JPEG_XL as u64 {
+            // a JPEG XL preview the range reader cannot validate: fall back (it needs the full read)
+            return None;
+        }
+        let jpeg = [t::compression::OLD_JPEG, t::compression::JPEG, t::compression::LOSSY_JPEG].iter().any(|&c| compression == c as u64);
+        if jpeg {
             match (find(t::STRIP_OFFSETS), find(t::STRIP_BYTE_COUNTS)) {
                 (Some(s), Some(l)) if s.count == 1 && l.count == 1 => consider(single_value(bytes, order, s)?, single_value(bytes, order, l)?),
                 (None, None) => {}
@@ -318,11 +341,6 @@ fn hasselblad_ifd(bytes: &[u8], order: ByteOrder, off: u64, is_ifd0: bool, seen:
                 return None;
             }
         }
-        Some(Some(_)) => {}
-    }
-    if find(t::COMPRESSION).and_then(|e| single_value(bytes, order, e)) == Some(t::compression::JPEG_XL as u64) {
-        // a JPEG XL preview the range reader cannot validate: fall back (it needs the full read)
-        return None;
     }
     // whole JPEG files stored as an undefined-type tag value (count and SOI gate as whole-file)
     for e in entries.iter().filter(|e| e.typ == 7 && e.count > 1024) {
@@ -337,20 +355,19 @@ fn hasselblad_ifd(bytes: &[u8], order: ByteOrder, off: u64, is_ifd0: bool, seen:
     for tag in [t::SUB_IFDS, t::EXIF_IFD, t::GPS_IFD, t::INTEROP_IFD] {
         let Some(e) = find(tag) else { continue };
         for o in child_offsets(bytes, order, e)? {
-            hasselblad_child(bytes, order, o, seen, best)?;
+            hasselblad_child(bytes, order, o, depth + 1, seen, best)?;
         }
     }
     // a vendor maker note may hold a preview IFD the prefix cannot see: fall back (the
-    // whole-file search parses it). Headerless notes (Hasselblad's) parse as garbage the SOI
-    // gate rejects in both searches; a garbage pointer landing exactly on a larger valid JPEG
-    // would need the file's second JPEG, which these files do not have.
+    // whole-file search parses it for one). Headerless notes (Hasselblad's on the measured
+    // body) are tried as a plain IFD there and skipped here — see the layout note above.
     if let Some(e) = find(t::MAKER_NOTE)
         && let Some((at, len)) = entry_range(bytes, order, e)
         && len > 16
         && let Ok(start) = usize::try_from(at)
         && let Some(end) = start.checked_add(16)
         && let Some(head) = bytes.get(start..end)
-        && is_vendor_note(head)
+        && makernote::has_vendor_header(head)
     {
         return None;
     }
@@ -361,8 +378,8 @@ fn hasselblad_ifd(bytes: &[u8], order: ByteOrder, off: u64, is_ifd0: bool, seen:
 }
 
 /// Scan a child IFD (its next pointer ignored, as in the whole-file search).
-fn hasselblad_child(bytes: &[u8], order: ByteOrder, off: u64, seen: &mut HashSet<u64>, best: &mut Option<(u64, u64)>) -> Option<()> {
-    hasselblad_ifd(bytes, order, off, false, seen, best).map(|_| ())
+fn hasselblad_child(bytes: &[u8], order: ByteOrder, off: u64, depth: usize, seen: &mut HashSet<u64>, best: &mut Option<(u64, u64)>) -> Option<()> {
+    hasselblad_ifd(bytes, order, off, false, depth, seen, best).map(|_| ())
 }
 
 /// Offsets a child-IFD pointer names (single or array, SHORT/LONG/IFD): all must read cleanly.
@@ -412,28 +429,6 @@ fn entry_range(bytes: &[u8], order: ByteOrder, e: &PrefixEntry) -> Option<(u64, 
         return Some((e.field as u64, total));
     }
     Some((order.read_u32(bytes, e.field)? as u64, total))
-}
-
-/// Whether a maker note's first bytes match a vendor header the whole-file search parses for
-/// preview IFDs (mirrors [`makernote::parse_makernote`]'s dispatch).
-fn is_vendor_note(head: &[u8]) -> bool {
-    const HEADERS: [&[u8]; 14] = [
-        b"Nikon\0",
-        b"FUJIFILM",
-        b"GENERALE",
-        b"OLYMPUS\0",
-        b"OM SYSTEM\0",
-        b"OLYMP\0",
-        b"EPSON\0",
-        b"MINOL\0",
-        b"CAMER\0",
-        b"SANYO\0",
-        b"Panasonic\0",
-        b"AOC\0",
-        b"PENTAX \0",
-        b"SONY",
-    ];
-    HEADERS.iter().any(|h| head.starts_with(h)) || head.starts_with(b"VHAB     \0")
 }
 
 /// Whether the note's vendor header cannot be ruled out: longer than 16 bytes (so it could be
@@ -645,19 +640,42 @@ mod tests {
     /// A minimal Hasselblad-shaped TIFF: IFD0 is a single-JPEG-strip preview (like a 3FR's),
     /// the SubIFD an uncompressed mosaic, EXIF a headerless note. The JPEG sits past 4096 so a
     /// test can prove the header alone locates it. `make` names the maker; `note_head` starts
-    /// the note (which holds no JPEG); `strips` sets IFD0's strip counts.
+    /// the note (which holds no JPEG); `strips` sets IFD0's strip counts. (Twin of the engine
+    /// tests' `tiff_3fr_with_embedded_jpeg`, which feeds the loader instead; keep the layouts
+    /// in step.)
     fn hasselblad_fixture(jpeg: &[u8], make: &[u8], note_head: &[u8], strips: u32) -> Vec<u8> {
-        fn entry(tag: u16, typ: u16, cnt: u32, val: u32) -> Vec<u8> {
+        hasselblad_fixture_order(jpeg, make, note_head, strips, ByteOrder::Little)
+    }
+
+    fn hasselblad_fixture_order(jpeg: &[u8], make: &[u8], note_head: &[u8], strips: u32, order: ByteOrder) -> Vec<u8> {
+        let w16 = |v: u16| match order {
+            ByteOrder::Little => v.to_le_bytes(),
+            ByteOrder::Big => v.to_be_bytes(),
+        };
+        let w32 = |v: u32| match order {
+            ByteOrder::Little => v.to_le_bytes(),
+            ByteOrder::Big => v.to_be_bytes(),
+        };
+        let entry = |tag: u16, typ: u16, cnt: u32, val: u32| {
             let mut e = Vec::with_capacity(12);
-            e.extend_from_slice(&tag.to_le_bytes());
-            e.extend_from_slice(&typ.to_le_bytes());
-            e.extend_from_slice(&cnt.to_le_bytes());
-            e.extend_from_slice(&val.to_le_bytes());
+            e.extend_from_slice(&w16(tag));
+            e.extend_from_slice(&w16(typ));
+            e.extend_from_slice(&w32(cnt));
+            // a single inline SHORT sits in the field's first two bytes (either order)
+            if typ == 3 && cnt == 1 {
+                e.extend_from_slice(&w16(val as u16));
+                e.extend_from_slice(&[0, 0]);
+            } else {
+                e.extend_from_slice(&w32(val));
+            }
             e
-        }
+        };
         let mut f = vec![0u8; 8];
-        f[..4].copy_from_slice(b"II\x2A\x00");
-        f[4..8].copy_from_slice(&8u32.to_le_bytes());
+        f[..4].copy_from_slice(match order {
+            ByteOrder::Little => b"II\x2A\x00",
+            ByteOrder::Big => b"MM\x00\x2A",
+        });
+        f[4..8].copy_from_slice(&w32(8));
         let table0 = 8 + 2 + 8 * 12 + 4; // 110
         let make_at = table0 as u32;
         let sub_at = make_at + make.len() as u32;
@@ -665,7 +683,7 @@ mod tests {
         let note_at = exif_at + (2 + 12 + 4) as u32;
         let note_len = 2048u32;
         let jpeg_off = 6000u32;
-        let mut ifd0 = (8u16).to_le_bytes().to_vec();
+        let mut ifd0 = w16(8).to_vec();
         for e in [
             entry(0x0100, 3, 1, 3888),
             entry(0x0101, 3, 1, 2918),
@@ -678,20 +696,20 @@ mod tests {
         ] {
             ifd0.extend(e);
         }
-        ifd0.extend(0u32.to_le_bytes());
+        ifd0.extend(w32(0));
         f.extend(ifd0);
         f.extend_from_slice(make);
-        let mut sub = (5u16).to_le_bytes().to_vec();
+        let mut sub = w16(5).to_vec();
         for e in
             [entry(0x0100, 3, 1, 11904), entry(0x0101, 3, 1, 8842), entry(0x0103, 3, 1, 1), entry(0x0111, 4, 1, 16384), entry(0x0117, 4, 1, 1000)]
         {
             sub.extend(e);
         }
-        sub.extend(0u32.to_le_bytes());
+        sub.extend(w32(0));
         f.extend(sub);
-        let mut exif = (1u16).to_le_bytes().to_vec();
+        let mut exif = w16(1).to_vec();
         exif.extend(entry(0x927C, 7, note_len, note_at));
-        exif.extend(0u32.to_le_bytes());
+        exif.extend(w32(0));
         f.extend(exif);
         let mut note = vec![0x23u8; note_len as usize];
         note[..note_head.len()].copy_from_slice(note_head);
@@ -719,7 +737,36 @@ mod tests {
         assert_eq!(embedded_preview_from_range(window, range).as_deref(), embedded_preview(&file).as_deref());
     }
 
-    /// Anything the header rule cannot mirror exactly falls back to the whole-file search:
+    /// The header rule reads a big-endian TIFF header too (Hasselblad writes little-endian,
+    /// but the walker is order-generic and the inline SHORT values sit differently).
+    #[test]
+    fn bounded_preview_locates_a_hasselblads_jpeg_from_a_big_endian_header() {
+        let jpeg = fake_jpeg(5000);
+        let file = hasselblad_fixture_order(&jpeg, b"Hasselblad\0", b"#\x00", 1, ByteOrder::Big);
+        let range = bounded_preview(&file[..4096]).expect("a big-endian 3FR header locates its preview");
+        assert_eq!(range.offset, 6000);
+        assert_eq!(range.window_len, jpeg.len() as u64);
+        let window = &file[range.offset as usize..(range.offset + range.window_len) as usize];
+        assert_eq!(embedded_preview_from_range(window, range).as_deref(), embedded_preview(&file).as_deref());
+    }
+
+    /// A crafted header cannot keep the walk busy: a child IFD pointing back at an IFD
+    /// already visited bails the rule out, and so does nesting past the depth cap.
+    #[test]
+    fn bounded_preview_bails_on_cyclic_and_deep_ifd_chains() {
+        let jpeg = fake_jpeg(5000);
+        let mut cyclic = hasselblad_fixture(&jpeg, b"Hasselblad\0", b"#\x00", 1);
+        // IFD0 sits at 8 (count, then 12-byte entries); its SubIFDs entry is the seventh,
+        // whose value field is at 8 + 2 + 6 * 12 + 8 = 90. Point it back at IFD0.
+        cyclic[90..94].copy_from_slice(&8u32.to_le_bytes());
+        assert!(bounded_preview(&cyclic[..4096]).is_none(), "a cyclic SubIFD falls back");
+        // the depth cap itself: the same IFD0 scans at depth 0 and bails past the cap
+        let mut seen = HashSet::new();
+        let mut best = None;
+        assert!(hasselblad_ifd(&cyclic[..4096], ByteOrder::Little, 8, true, MAX_HEADER_IFD_DEPTH + 1, &mut seen, &mut best).is_none());
+    }
+
+    /// Anything the header rule cannot mirror falls back to the whole-file search:
     /// another maker, a cut table, several strips, a vendor note.
     #[test]
     fn bounded_preview_bails_unless_the_whole_layout_is_visible() {

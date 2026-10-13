@@ -33,6 +33,36 @@ pub enum MakerNoteKind {
     Pentax,
 }
 
+/// Vendor maker-note headers [`parse_makernote`] dispatches on (a note with none of them is
+/// parsed as a plain IFD at its start). The dispatch below and [`has_vendor_header`] share
+/// these, so a caller ruling vendor notes in or out from a header prefix cannot drift from
+/// the parser.
+const NIKON: &[u8] = b"Nikon\0";
+const FUJIFILM: &[u8] = b"FUJIFILM";
+const GENERALE: &[u8] = b"GENERALE";
+const OLYMPUS: &[u8] = b"OLYMPUS\0";
+const OM_SYSTEM: &[u8] = b"OM SYSTEM\0";
+const OLYMP: &[u8] = b"OLYMP\0";
+const EPSON: &[u8] = b"EPSON\0";
+const MINOL: &[u8] = b"MINOL\0";
+const CAMER: &[u8] = b"CAMER\0";
+const SANYO: &[u8] = b"SANYO\0";
+const PANASONIC: &[u8] = b"Panasonic\0";
+const AOC: &[u8] = b"AOC\0";
+const PENTAX: &[u8] = b"PENTAX \0";
+const SONY: &[u8] = b"SONY";
+const VHAB: &[u8] = b"VHAB     \0";
+
+const VENDOR_HEADERS: [&[u8]; 15] =
+    [NIKON, FUJIFILM, GENERALE, OLYMPUS, OM_SYSTEM, OLYMP, EPSON, MINOL, CAMER, SANYO, PANASONIC, AOC, PENTAX, SONY, VHAB];
+
+/// Whether a maker note's first bytes carry a vendor header [`parse_makernote`] dispatches on
+/// (as opposed to a headerless note, which it parses as a plain IFD). For callers that hold
+/// only a prefix of the note and must decide without parsing it.
+pub fn has_vendor_header(head: &[u8]) -> bool {
+    VENDOR_HEADERS.iter().any(|h| head.starts_with(h))
+}
+
 /// A parsed maker-note IFD.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct MakerNote {
@@ -60,7 +90,7 @@ pub fn parse_makernote(data: &[u8], offset: u64, len: u64, order: ByteOrder, mak
         let (ifd, _) = parse_ifd_at(data, ifd_at, ord, base, false, &opts).ok()?;
         (!ifd.entries.is_empty()).then_some(MakerNote { kind, order: ord, base, ifd })
     };
-    if note.starts_with(b"Nikon\0") {
+    if note.starts_with(NIKON) {
         if note.get(6) == Some(&1) {
             return try_parse(MakerNoteKind::NikonV1, offset + 8, 0, order);
         }
@@ -69,32 +99,32 @@ pub fn parse_makernote(data: &[u8], offset: u64, len: u64, order: ByteOrder, mak
         let base = offset + 10;
         return try_parse(MakerNoteKind::NikonV3, base + ifd_rel, base, ord);
     }
-    if note.starts_with(b"FUJIFILM") || note.starts_with(b"GENERALE") {
+    if note.starts_with(FUJIFILM) || note.starts_with(GENERALE) {
         let rel = ByteOrder::Little.read_u32(note, 8)? as u64;
         return try_parse(MakerNoteKind::Fujifilm, offset + rel, offset, ByteOrder::Little);
     }
-    if note.starts_with(b"OLYMPUS\0") || note.starts_with(b"OM SYSTEM\0") {
-        let (ord_at, ifd_at) = if note.starts_with(b"OM SYSTEM\0") { (12, 16) } else { (8, 12) };
+    if note.starts_with(OLYMPUS) || note.starts_with(OM_SYSTEM) {
+        let (ord_at, ifd_at) = if note.starts_with(OM_SYSTEM) { (12, 16) } else { (8, 12) };
         let ord = order_at(ord_at).unwrap_or(order);
         return try_parse(MakerNoteKind::OlympusNew, offset + ifd_at, offset, ord);
     }
-    for p in [b"OLYMP\0", b"EPSON\0", b"MINOL\0", b"CAMER\0", b"SANYO\0"] {
+    for p in [OLYMP, EPSON, MINOL, CAMER, SANYO] {
         if note.starts_with(p) {
             return try_parse(MakerNoteKind::OlympusOld, offset + 8, 0, order);
         }
     }
-    if note.starts_with(b"Panasonic\0") {
+    if note.starts_with(PANASONIC) {
         return try_parse(MakerNoteKind::Panasonic, offset + 12, 0, order);
     }
-    if note.starts_with(b"AOC\0") {
+    if note.starts_with(AOC) {
         let ord = order_at(4).unwrap_or(order);
         return try_parse(MakerNoteKind::PentaxAoc, offset + 6, 0, ord);
     }
-    if note.starts_with(b"PENTAX \0") {
+    if note.starts_with(PENTAX) {
         let ord = order_at(8).unwrap_or(order);
         return try_parse(MakerNoteKind::Pentax, offset + 10, offset, ord);
     }
-    if (note.starts_with(b"SONY") || note.starts_with(b"VHAB     \0"))
+    if (note.starts_with(SONY) || note.starts_with(VHAB))
         && let Some(m) = try_parse(MakerNoteKind::Sony, offset + 12, 0, order)
     {
         return Some(m);
@@ -190,6 +220,21 @@ mod tests {
         let m = parse_makernote(&bytes, off, len, order, "Canon").unwrap();
         assert_eq!(m.kind, MakerNoteKind::Plain);
         assert_eq!(m.ifd.u64s(2).unwrap(), vec![9, 0]);
+    }
+
+    #[test]
+    fn vendor_headers_are_the_dispatch_headers() {
+        // every header the dispatch matches is reported, with bytes after it or exactly at it
+        for h in VENDOR_HEADERS {
+            assert!(has_vendor_header(h), "{h:?}");
+            let mut note = h.to_vec();
+            note.extend_from_slice(b"the rest of the note");
+            assert!(has_vendor_header(&note), "{h:?} with a body");
+        }
+        // headerless notes (parsed as a plain IFD) and cut-off headers are not
+        assert!(!has_vendor_header(b"#\x00\x01\x02the rest"));
+        assert!(!has_vendor_header(b"Nik"));
+        assert!(!has_vendor_header(b""));
     }
 
     #[test]

@@ -1142,6 +1142,8 @@ mod tests {
     /// A minimal Hasselblad-shaped TIFF: IFD0 is a single-JPEG-strip preview (like a 3FR's),
     /// the SubIFD an uncompressed mosaic, EXIF a headerless note; the JPEG sits past the 4 KiB
     /// prefix and a raw tail follows it, so a test can prove the header alone locates the preview.
+    /// (Twin of the raw tests' `hasselblad_fixture`, which feeds `bounded_preview` instead;
+    /// keep the layouts in step.)
     fn tiff_3fr_with_embedded_jpeg(jpeg: &[u8], tail: usize) -> Vec<u8> {
         fn entry(tag: u16, typ: u16, cnt: u32, val: u32) -> Vec<u8> {
             let mut e = Vec::with_capacity(12);
