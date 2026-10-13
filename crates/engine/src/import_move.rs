@@ -198,20 +198,7 @@ pub(crate) fn place(src: &Path, dir: &Path, name: &str) -> Result<Placed, String
 /// (whose recorded metadata and hash would be stale). Without one the copy is compared byte for
 /// byte with the source.
 pub(crate) fn copy_new(src: &Path, dir: &Path, name: &str, expect: Option<lightcraft_preview::Hash128>) -> Result<PathBuf, String> {
-    fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    let (stem, ext) = match name.rsplit_once('.') {
-        Some((s, e)) if !s.is_empty() => (s.to_string(), format!(".{e}")),
-        _ => (name.to_string(), String::new()),
-    };
-    for i in 0..100_000u32 {
-        let d = if i == 0 { dir.join(name) } else { dir.join(format!("{stem}-{i}{ext}")) };
-        match copy_verified(src, &d, expect) {
-            Ok(()) => return Ok(d),
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(e) => return Err(format!("copy {}: {e} (nothing was imported from it; the original is untouched)", src.display())),
-        }
-    }
-    Err(format!("copy {}: no free name in {}", src.display(), dir.display()))
+    copy_new_with(src, dir, name, |s, d| copy_verified(s, d, expect)).map(|(p, ())| p)
 }
 
 /// [`copy_new`] without a probe hash: the source is hashed as it streams into the copy, and the
@@ -219,6 +206,13 @@ pub(crate) fn copy_new(src: &Path, dir: &Path, name: &str, expect: Option<lightc
 /// headers only now, so most copies arrive hashless; the verification is the same strength as
 /// the byte comparison it replaces. Returns the new path and the verified hash.
 pub(crate) fn copy_new_streaming(src: &Path, dir: &Path, name: &str) -> Result<(PathBuf, lightcraft_preview::Hash128), String> {
+    copy_new_with(src, dir, name, copy_streaming_verified)
+}
+
+/// Copy `src` into `dir` as `name` (-1, -2… when taken) with the caller's verified copy:
+/// the name search both import copies share. A bad copy is reported with the source
+/// untouched; a taken name is never overwritten.
+fn copy_new_with<T>(src: &Path, dir: &Path, name: &str, mut copy: impl FnMut(&Path, &Path) -> io::Result<T>) -> Result<(PathBuf, T), String> {
     fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let (stem, ext) = match name.rsplit_once('.') {
         Some((s, e)) if !s.is_empty() => (s.to_string(), format!(".{e}")),
@@ -226,8 +220,8 @@ pub(crate) fn copy_new_streaming(src: &Path, dir: &Path, name: &str) -> Result<(
     };
     for i in 0..100_000u32 {
         let d = if i == 0 { dir.join(name) } else { dir.join(format!("{stem}-{i}{ext}")) };
-        match copy_streaming_verified(src, &d) {
-            Ok(h) => return Ok((d, h)),
+        match copy(src, &d) {
+            Ok(t) => return Ok((d, t)),
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(e) => return Err(format!("copy {}: {e} (nothing was imported from it; the original is untouched)", src.display())),
         }
@@ -315,40 +309,11 @@ fn link_or_copy(src: &Path, dst: &Path) -> io::Result<()> {
 /// source) when given, else byte for byte against the source. On any failure the partial copy is
 /// removed.
 pub(crate) fn copy_verified(src: &Path, dst: &Path, expect: Option<lightcraft_preview::Hash128>) -> io::Result<()> {
-    let mut out = OpenOptions::new().write(true).create_new(true).open(dst)?;
-    let r = (|| {
-        let mut inp = File::open(src)?;
-        if injected(Fault::FailWrite) {
-            out.write_all(b"partial")?;
-            return Err(io::Error::other("write failed (injected)"));
-        }
-        io::copy(&mut inp, &mut out)?;
-        #[cfg(test)]
-        if injected(Fault::Slow) {
-            COPY_THREADS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(std::thread::current().id());
-            std::thread::sleep(std::time::Duration::from_millis(30));
-        }
-        if injected(Fault::Corrupt) {
-            out.write_all(b"!")?;
-        }
-        out.sync_all()?;
-        if let Ok(m) = fs::metadata(src).and_then(|m| m.modified()) {
-            let _ = out.set_modified(m);
-        }
-        match expect {
-            Some(h) if hash_file(dst)? != h => {
-                Err(io::Error::other("the copy differs from the original as it was read for the import (a bad copy, or the file changed meanwhile)"))
-            }
-            Some(_) => Ok(()),
-            None if !same_bytes(src, dst)? => Err(io::Error::other("the copy differs from the original")),
-            None => Ok(()),
-        }
-    })();
-    drop(out);
-    if r.is_err() {
-        let _ = fs::remove_file(dst);
-    }
-    r
+    let check = match expect {
+        Some(h) => CopyCheck::ProbeHash(h),
+        None => CopyCheck::ByteForByte,
+    };
+    copy_checked(src, dst, check).map(|_| ())
 }
 
 /// Copy into a new file, sync it to disk and verify it: the source's hash is computed as its
@@ -356,6 +321,27 @@ pub(crate) fn copy_verified(src: &Path, dst: &Path, expect: Option<lightcraft_pr
 /// failure the partial copy is removed. (The counterpart of [`copy_verified`] for copies whose
 /// probe read headers only and carries no hash.)
 pub(crate) fn copy_streaming_verified(src: &Path, dst: &Path) -> io::Result<lightcraft_preview::Hash128> {
+    match copy_checked(src, dst, CopyCheck::StreamedHash)? {
+        Some(h) => Ok(h),
+        None => Err(io::Error::other("the copy differs from the original")),
+    }
+}
+
+/// How a copy is verified ([`copy_checked`]).
+#[derive(Clone, Copy)]
+enum CopyCheck {
+    /// The copy is hashed back and checked against the probe's hash of the source.
+    ProbeHash(lightcraft_preview::Hash128),
+    /// The copy is compared byte for byte with the source (a move deletes it on this check).
+    ByteForByte,
+    /// The source is hashed as it streams in; the copy is hashed back against that.
+    StreamedHash,
+}
+
+/// The verified copies, in one place: copy into a new file, sync it to disk and verify it
+/// as `check` says; on any failure the partial copy is removed. The streamed copy reports
+/// the hash it verified; the others report none.
+fn copy_checked(src: &Path, dst: &Path, check: CopyCheck) -> io::Result<Option<lightcraft_preview::Hash128>> {
     let mut out = OpenOptions::new().write(true).create_new(true).open(dst)?;
     let r = (|| {
         let mut inp = File::open(src)?;
@@ -363,16 +349,25 @@ pub(crate) fn copy_streaming_verified(src: &Path, dst: &Path) -> io::Result<ligh
             out.write_all(b"partial")?;
             return Err(io::Error::other("write failed (injected)"));
         }
-        let mut h = lightcraft_preview::Hasher128::new();
-        let mut buf = vec![0u8; 1 << 20];
-        loop {
-            let n = fill(&mut inp, &mut buf)?;
-            if n == 0 {
-                break;
+        let streamed = match check {
+            CopyCheck::StreamedHash => {
+                let mut h = lightcraft_preview::Hasher128::new();
+                let mut buf = vec![0u8; 1 << 20];
+                loop {
+                    let n = fill(&mut inp, &mut buf)?;
+                    if n == 0 {
+                        break;
+                    }
+                    h.update(buf.get(..n).unwrap_or(&[]));
+                    out.write_all(buf.get(..n).unwrap_or(&[]))?;
+                }
+                Some(h.finish())
             }
-            h.update(buf.get(..n).unwrap_or(&[]));
-            out.write_all(buf.get(..n).unwrap_or(&[]))?;
-        }
+            _ => {
+                io::copy(&mut inp, &mut out)?;
+                None
+            }
+        };
         #[cfg(test)]
         if injected(Fault::Slow) {
             COPY_THREADS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(std::thread::current().id());
@@ -385,11 +380,18 @@ pub(crate) fn copy_streaming_verified(src: &Path, dst: &Path) -> io::Result<ligh
         if let Ok(m) = fs::metadata(src).and_then(|m| m.modified()) {
             let _ = out.set_modified(m);
         }
-        let src_hash = h.finish();
-        if hash_file(dst)? != src_hash {
-            return Err(io::Error::other("the copy differs from the original"));
+        match check {
+            CopyCheck::ProbeHash(h) if hash_file(dst)? != h => {
+                Err(io::Error::other("the copy differs from the original as it was read for the import (a bad copy, or the file changed meanwhile)"))
+            }
+            CopyCheck::ProbeHash(_) => Ok(None),
+            CopyCheck::ByteForByte if !same_bytes(src, dst)? => Err(io::Error::other("the copy differs from the original")),
+            CopyCheck::ByteForByte => Ok(None),
+            CopyCheck::StreamedHash => match streamed {
+                Some(h) if hash_file(dst)? == h => Ok(Some(h)),
+                _ => Err(io::Error::other("the copy differs from the original")),
+            },
         }
-        Ok(src_hash)
     })();
     drop(out);
     if r.is_err() {
