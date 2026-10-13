@@ -515,7 +515,6 @@ pub(crate) fn probe_paths(s: &Session, paths: &[String]) -> Vec<Result<ProbeInfo
 }
 
 fn probe_all(probe: Option<&crate::media::FileProbe>, paths: &[String], progress: &ScanProgress) -> Vec<Result<ProbeInfo, String>> {
-    use std::sync::atomic::Ordering::Relaxed;
     let Some(probe) = probe.cloned() else {
         return paths
             .iter()
@@ -527,47 +526,14 @@ fn probe_all(probe: Option<&crate::media::FileProbe>, paths: &[String], progress
             })
             .collect();
     };
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        let n = workers(paths.len());
-        if n > 1 {
-            let mut results: Vec<Option<Result<ProbeInfo, String>>> = vec![None; paths.len()];
-            let next = std::sync::atomic::AtomicUsize::new(0);
-            let out = std::sync::Mutex::new(&mut results);
-            std::thread::scope(|sc| {
-                for _ in 0..n {
-                    sc.spawn(|| {
-                        loop {
-                            let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            if i >= paths.len() {
-                                break;
-                            }
-                            if progress.cancel.load(Relaxed) {
-                                break;
-                            }
-                            let r = probe(&paths[i]);
-                            stream_probed(progress, &paths[i], &r);
-                            progress.done.fetch_add(1, Relaxed);
-                            out.lock().unwrap_or_else(|e| e.into_inner())[i] = Some(r);
-                        }
-                    });
-                }
-            });
-            return results.into_iter().map(|r| r.unwrap_or_else(|| Err("not probed".into()))).collect();
-        }
-    }
-    paths
-        .iter()
-        .map(|p| {
-            if progress.cancel.load(Relaxed) {
-                return Err("cancelled".into());
-            }
-            let r = probe(p);
-            stream_probed(progress, p, &r);
-            progress.done.fetch_add(1, Relaxed);
-            r
-        })
-        .collect()
+    // several at once where threads exist; each result streams out as it lands (streaming
+    // scans), and one the cancel kept from starting comes back as "cancelled"
+    let probed = par_map(paths, progress, &progress.cancel, |p| {
+        let r = probe(p);
+        stream_probed(progress, p, &r);
+        r
+    });
+    probed.into_iter().map(|r| r.unwrap_or_else(|| Err("cancelled".into()))).collect()
 }
 
 /// Run `f` over `items` — several at once on native targets, one by one on wasm — counting
