@@ -676,24 +676,18 @@ fn finish_scan(app: &mut LightcraftApp, ctx: &egui::Context, out: ScanOutput) {
 /// checks and the selection by path (a photo unchecked mid-scan stays unchecked; duplicates
 /// still arrive unchecked); the selection anchor follows its photo.
 fn carry_over(d: &mut ImportDialog, old: &ImportDialog) {
-    d.copy = old.copy;
-    d.move_files = old.move_files;
-    d.album = old.album;
-    d.new_album.clone_from(&old.new_album);
-    d.preset.clone_from(&old.preset);
-    d.keywords.clone_from(&old.keywords);
-    d.destination.clone_from(&old.destination);
-    d.organize.clone_from(&old.organize);
-    d.folder_template.clone_from(&old.folder_template);
-    d.rename.clone_from(&old.rename);
-    d.metadata_preset.clone_from(&old.metadata_preset);
-    d.dng = old.dng;
-    d.on_deleted.clone_from(&old.on_deleted);
-    d.sources.clone_from(&old.sources);
     let mut old_state: std::collections::HashMap<&str, (bool, bool)> = std::collections::HashMap::with_capacity(old.candidates.len());
     for (i, c) in old.candidates.iter().enumerate() {
         old_state.insert(c.path.as_str(), (old.checked.get(i).copied().unwrap_or(true), old.selected.get(i).copied().unwrap_or(false)));
     }
+    let anchor = old.last_clicked.and_then(|j| old.candidates.get(j)).map(|o| o.path.clone());
+    // The finished scan owns the candidates and their default checks; the live review owns
+    // every other choice. Starting from the live dialog carries options added later too,
+    // where a field-by-field list would silently drop them.
+    let (candidates, checked, selected, trashed) =
+        (std::mem::take(&mut d.candidates), std::mem::take(&mut d.checked), std::mem::take(&mut d.selected), std::mem::take(&mut d.trashed));
+    *d = old.clone();
+    (d.candidates, d.checked, d.selected, d.trashed) = (candidates, checked, selected, trashed);
     for (i, c) in d.candidates.iter().enumerate() {
         if let Some((checked, selected)) = old_state.get(c.path.as_str()) {
             if let Some(slot) = d.checked.get_mut(i) {
@@ -704,7 +698,7 @@ fn carry_over(d: &mut ImportDialog, old: &ImportDialog) {
             }
         }
     }
-    d.last_clicked = old.last_clicked.and_then(|j| old.candidates.get(j)).and_then(|o| d.candidates.iter().position(|c| c.path == o.path));
+    d.last_clicked = anchor.and_then(|p| d.candidates.iter().position(|c| c.path == p));
 }
 
 impl ScanTask {
@@ -1068,7 +1062,10 @@ pub fn body(app: &mut LightcraftApp, ui: &mut egui::Ui, d: &mut ImportDialog) {
             }
             if crate::widgets::text_button(ui, "importAll", crate::i18n::tr("Check All"), false).clicked() {
                 for i in 0..n {
-                    d.checked[i] = d.importable(i);
+                    let on = d.importable(i);
+                    if let Some(slot) = d.checked.get_mut(i) {
+                        *slot = on;
+                    }
                 }
             }
         });
@@ -1410,12 +1407,12 @@ fn candidate_cell(app: &mut LightcraftApp, ui: &mut egui::Ui, d: &mut ImportDial
         // still loading: a spinner, which repaints itself until the texture arrives
         egui::Spinner::new().size(22.0).color(t.text_dim).paint_at(ui, Rect::from_center_size(img.center(), vec2(24.0, 24.0)));
     }
-    let on = d.checked[i] && ok;
+    let on = d.checked.get(i).copied().unwrap_or(false) && ok;
     if on {
         p.rect_stroke(img, 3.0, Stroke::new(2.0, t.accent), StrokeKind::Inside);
     }
     // selection: the library grid's white ring, outside the checked one so both show at once
-    if d.selected[i] {
+    if d.selected.get(i).copied().unwrap_or(false) {
         p.rect_stroke(img, 3.0, Stroke::new(2.0, Color32::WHITE), StrokeKind::Outside);
     }
     // checkbox
@@ -1787,8 +1784,21 @@ mod tests {
         old.checked = vec![false, true];
         old.selected = vec![true, false];
         old.last_clicked = Some(0);
-        old.keywords = "trip".into();
+        // every option the dialog carries, set away from its default
+        old.sources = vec!["/card".into()];
         old.copy = true;
+        old.move_files = true;
+        old.album = Some(4);
+        old.new_album = "Card 1".into();
+        old.preset = "p1".into();
+        old.keywords = "trip".into();
+        old.destination = "/dest".into();
+        old.organize = "month".into();
+        old.folder_template = "{date:%Y}".into();
+        old.rename = "{name}-x".into();
+        old.metadata_preset = "mine".into();
+        old.dng = true;
+        old.on_deleted = "fresh".into();
         let dup =
             ImportCandidate { path: "a.png".into(), name: "a.png".into(), duplicate: Some("path".into()), existing: Some(7), ..Default::default() };
         let mut d = ImportDialog::new(vec![dup, cand("b.png")]);
@@ -1796,7 +1806,18 @@ mod tests {
         assert_eq!(d.checked, [false, false], "the duplicate stays unchecked; the uncheck is kept");
         assert_eq!(d.selected, [false, true], "the selection followed its photo");
         assert_eq!(d.last_clicked, Some(1), "the anchor followed its photo");
+        // ... and every option came over verbatim (a field the list forgot would fail here)
+        assert_eq!(d.sources, ["/card"]);
+        assert!(d.copy && d.move_files && d.dng);
+        assert_eq!(d.album, Some(4));
+        assert_eq!(d.new_album, "Card 1");
+        assert_eq!(d.preset, "p1");
         assert_eq!(d.keywords, "trip");
-        assert!(d.copy);
+        assert_eq!(d.destination, "/dest");
+        assert_eq!(d.organize, "month");
+        assert_eq!(d.folder_template, "{date:%Y}");
+        assert_eq!(d.rename, "{name}-x");
+        assert_eq!(d.metadata_preset, "mine");
+        assert_eq!(d.on_deleted, "fresh");
     }
 }
